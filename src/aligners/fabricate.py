@@ -296,7 +296,7 @@ def run_export(case: Case, stages: str = "", jobs: int = 4) -> dict[str, Any]:
         manifest["jaws"][jaw] = {
             "stages": staged["jaws"][jaw]["stages"],
             "files": sorted(r["file"] for r in results if r["jaw"] == jaw),
-            "ipr_before_stage_1_mm": setup["jaws"][jaw]["ipr_mm"],
+            "ipr_before_stage_1_mm": staged["jaws"][jaw]["ipr_mm"],
             "attachments": {
                 str(n): {"type": k, "bond": "before stage 1 with template.stl"}
                 for n, k in export_plan[jaw]["attachments"].items()

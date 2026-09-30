@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 import trimesh
+from scipy.spatial import KDTree
 
 from aligners.analyze import arch_to_bite, posed_tooth
 from aligners.anatomy import JawAnatomy, submesh
@@ -17,6 +18,7 @@ from aligners.motion import decompose
 TOOTH_FACES = 5000
 ROOT_FACES = 2500
 GUM_FACES = 60000
+GUM_FOLLOW_MM = 3.0
 
 
 def _pack(mesh: trimesh.Trimesh) -> dict[str, str]:
@@ -28,7 +30,6 @@ def _pack(mesh: trimesh.Trimesh) -> dict[str, str]:
 
 def build_preview(case: Case) -> str:
     staged = read_json(case.require(case.work / "stages.json", "stage"))
-    setup = read_json(case.work / "setup.json")
     checks = (
         read_json(case.work / "checks.json")
         if (case.work / "checks.json").exists()
@@ -70,12 +71,29 @@ def build_preview(case: Case) -> str:
         group = np.eye(4)
         if to_bite:
             group = np.linalg.inv(to_bite["lower"]) @ to_bite[jaw]
+        # gingiva follows the teeth near it with weight (1 - d/3mm)^2, blending the two nearest
+        # crowns by inverse squared distance: a papilla between two moving teeth stretches
+        # instead of tearing, and the margin at a crown still follows that crown exactly
+        order = anatomy.order()
+        gum_v = np.asarray(gum.vertices)
+        dist = np.column_stack(
+            [KDTree(np.asarray(anatomy.patches[n].vertices)).query(gum_v)[0] for n in order]
+        )
+        two = np.argsort(dist, axis=1)[:, :2] if len(order) > 1 else np.zeros((len(gum_v), 2), int)
+        d2 = np.take_along_axis(dist, two, axis=1)
+        inverse = 1.0 / (d2 + 0.05) ** 2
+        share = inverse[:, 0] / inverse.sum(axis=1)
+        weight = np.clip(1.0 - d2[:, 0] / GUM_FOLLOW_MM, 0.0, 1.0) ** 2
         data["jaws"][jaw] = {
             "gum": _pack(gum),
+            "gumTooth": [order[i] for i in two[:, 0]],
+            "gumTooth2": [order[i] for i in two[:, 1]],
+            "gumShare": share.round(3).tolist(),
+            "gumWeight": weight.round(3).tolist(),
             "teeth": teeth,
             "stages": info["stages"],
             "group": group.T.ravel().round(6).tolist(),
-            "ipr": setup["jaws"][jaw]["ipr_mm"],
+            "ipr": info["ipr_mm"],
             "attachments": export_plan.get(jaw, {}).get("attachments", {}),
         }
     html = TEMPLATE.replace("/*DATA*/", json.dumps(to_jsonable(data)))
@@ -118,6 +136,13 @@ TEMPLATE = r"""<!doctype html>
       <button id="play">Play</button></div>
     <input id="stage" type="range" min="0" value="0" step="1">
     <div class="row">
+      <button data-view="front">Front</button>
+      <button data-view="right">Right</button>
+      <button data-view="left">Left</button>
+      <button data-view="upper">Upper occlusal</button>
+      <button data-view="lower">Lower occlusal</button>
+    </div>
+    <div class="row">
       <label><input type="checkbox" id="upper" checked> Upper</label>
       <label><input type="checkbox" id="lower" checked> Lower</label>
       <label><input type="checkbox" id="gum" checked> Gingiva</label>
@@ -157,12 +182,14 @@ const gumMat = new THREE.MeshStandardMaterial({ color: 0xe8a0a0, roughness: 0.7,
 const rootMat = new THREE.MeshStandardMaterial({ color: 0xd8c8a0, transparent: true, opacity: 0.5 });
 const ghostMat = new THREE.MeshStandardMaterial({ color: 0x8899aa, transparent: true, opacity: 0.25, depthWrite: false });
 const hotMat = new THREE.MeshStandardMaterial({ color: 0xffc36b, roughness: 0.45 });
-const groups = {}, teeth = [], gums = [], roots = [], ghosts = [];
+const groups = {}, teeth = [], gums = [], roots = [], ghosts = [], skins = [];
 let maxStage = 0;
 for (const [jaw, J] of Object.entries(DATA.jaws)) {
   const group = new THREE.Group(); group.matrixAutoUpdate = false; group.matrix.fromArray(J.group);
   scene.add(group); groups[jaw] = group; maxStage = Math.max(maxStage, J.stages);
   const gum = new THREE.Mesh(decode(J.gum), gumMat); group.add(gum); gums.push(gum);
+  const rest = gum.geometry.attributes.position.array.slice();
+  skins.push({ gum, rest, tooth: J.gumTooth, tooth2: J.gumTooth2, share: J.gumShare, weight: J.gumWeight, jaw });
   for (const [n, T] of Object.entries(J.teeth)) {
     const geo = decode(T.crown);
     const tooth = new THREE.Group(); tooth.matrixAutoUpdate = false;
@@ -173,12 +200,47 @@ for (const [jaw, J] of Object.entries(DATA.jaws)) {
   }
 }
 const slider = document.getElementById('stage'); slider.max = maxStage;
+const VIEWS = {  // camera position, view-up; lower arch frame: +z toward the upper arch, +y anterior
+  front: [[0, 110, 5], [0, 0, 1], null],
+  right: [[-110, -15, 5], [0, 0, 1], null],
+  left: [[110, -15, 5], [0, 0, 1], null],
+  upper: [[0, -18, -110], [0, 1, 0], 'upper'],
+  lower: [[0, -18, 110], [0, 1, 0], 'lower'],
+};
+function setView(name) {
+  const [pos, up, only] = VIEWS[name];
+  camera.position.set(...pos); camera.up.set(...up); controls.target.set(0, -18, 0); controls.update();
+  for (const jaw of ['upper', 'lower']) {
+    const show = !only || only === jaw;
+    groups[jaw].visible = show; document.getElementById(jaw).checked = show;
+  }
+}
+document.querySelectorAll('[data-view]').forEach(b => b.onclick = () => setView(b.dataset.view));
 document.getElementById('stageMax').textContent = maxStage;
 function setStage(s) {
   document.getElementById('stageLabel').textContent = s;
-  for (const t of teeth) { const k = Math.min(s, t.T.poses.length - 1); t.tooth.matrix.fromArray(t.T.poses[k]); t.stage = k; }
+  const mats = {};
+  for (const t of teeth) {
+    const k = Math.min(s, t.T.poses.length - 1); t.tooth.matrix.fromArray(t.T.poses[k]); t.stage = k;
+    mats[t.jaw + ':' + t.mesh.userData.n] = t.tooth.matrix;
+  }
+  // blend gingiva vertices toward the poses of their two nearest teeth
+  const v = new THREE.Vector3(), u = new THREE.Vector3();
+  for (const sk of skins) {
+    const pos = sk.gum.geometry.attributes.position, a = pos.array, r = sk.rest;
+    for (let i = 0; i < sk.weight.length; i++) {
+      const w = sk.weight[i];
+      if (w <= 0) { a[3*i] = r[3*i]; a[3*i+1] = r[3*i+1]; a[3*i+2] = r[3*i+2]; continue; }
+      v.set(r[3*i], r[3*i+1], r[3*i+2]).applyMatrix4(mats[sk.jaw + ':' + sk.tooth[i]]);
+      u.set(r[3*i], r[3*i+1], r[3*i+2]).applyMatrix4(mats[sk.jaw + ':' + sk.tooth2[i]]);
+      v.lerp(u, 1 - sk.share[i]);
+      a[3*i] = r[3*i] + w * (v.x - r[3*i]); a[3*i+1] = r[3*i+1] + w * (v.y - r[3*i+1]); a[3*i+2] = r[3*i+2] + w * (v.z - r[3*i+2]);
+    }
+    pos.needsUpdate = true; sk.gum.geometry.computeVertexNormals();
+  }
 }
 slider.oninput = () => setStage(+slider.value); setStage(0);
+window.preview = { setStage: (s) => { slider.value = s; setStage(s); }, setView, maxStage, camera, controls, groups, gums };
 let timer = null;
 document.getElementById('play').onclick = (e) => {
   if (timer) { clearInterval(timer); timer = null; e.target.textContent = 'Play'; return; }

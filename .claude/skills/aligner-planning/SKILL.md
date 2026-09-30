@@ -24,7 +24,10 @@ image tool.
 
 1. `uv run aligners ct cases/<name> --json` (first run: TotalSegmentator on CPU, ~15 min).
 2. `uv run aligners segment cases/<name> --json`. Read `bite` (`scans` or `ct`) and warnings.
-   View `segmentation_upper.png` / `segmentation_lower.png`: every crown one color, labels on
+   The tooth/gingiva boundary is snapped onto the gingival crease, and the arch frames are
+   leveled to the occlusal plane through the tooth tips (`occlusal_leveling_deg` in
+   `frames.json`). View `segmentation_upper.png` / `segmentation_lower.png`: every crown one
+   color (no colored collar on the gingiva, no gingiva patches inside a crown), labels on
    the right teeth (FDI: 1x upper right, 2x upper left, 3x lower left, 4x lower right; the
    render's "right" panel is the patient's right side). Fix wrong numbers with
    `uv run aligners relabel cases/<name> --jaw upper --map 21=22,22=21` (`N=0` makes a region
@@ -54,15 +57,30 @@ image tool.
 
 ## Choosing goals (`plan.toml`)
 
-- Mild crowding (< 4 mm per arch): allow IPR (`ipr_max_*`), a little incisor advancement
-  (`max_incisor_advance_mm` <= 1.5) and/or expansion. Prefer expansion only where arches are
-  narrow (`expand_premolar_mm` <= 3 total, `expand_molar_mm` <= 2 total).
+- How the solver makes space: the ideal arch hugs the outermost teeth (lingually displaced
+  teeth come out, well-placed ones are not pulled in), incisors advance up to
+  `max_incisor_advance_mm`, and IPR is used only for what remains (and by `stage` where a
+  derotating tooth cannot pass its neighbor otherwise). Bucco-lingual moves are done by
+  tipping (`tipping`, `tipping_pivot`), so inclinations change; `harmonize_inclination`
+  gives left/right homologous teeth the same inclination, and `level_incisal_edges` tips the
+  incisors so their incisal edges are horizontal in the frontal view.
+- `anchors` (default: 6s-8s) keep their place along the arch and their occlusion; they only
+  follow the arch transversely (expansion). Remove a tooth from the list to align it fully.
+- Mild crowding (< 4 mm per arch): the defaults usually suffice. If `setup` reports crowding
+  left, add transverse expansion where the arch is narrow (`expand_premolar_mm` <= 3 total,
+  `expand_molar_mm` <= 2 total) before raising IPR limits.
+- `bite.min_overjet_mm` and `bite.min_overbite_mm` are always kept: proclining incisors
+  flattens the bite, so the solver extrudes incisors if the overbite would drop below.
+  Lower incisors that would hit the upper ones push the upper front forward (up to
+  `max_incisor_advance_mm`), then open the bite by intruding incisors (not below
+  `min_overbite_mm`); new posterior interferences intrude the pair and its homologs a little.
 - Spacing: `close_spaces = true`; retraction is capped by `max_incisor_retract_mm`. With a small
   overjet, do not retract upper incisors (keep `bite.min_overjet_mm`).
 - Deep bite: `spee_flatten` 0.3-0.6 on the lower arch, or `bite.enforce = true` with an
   `overbite_mm` target. Open bite: `bite.enforce` with a positive overbite target.
 - Overjet: `bite.enforce = true`, `overjet_mm` 2-3.
-- Midlines: `bite.align_midlines = true`, or `midline_shift_mm` per jaw (+ = patient left).
+- Midlines: `bite.align_midlines` (default on) moves the upper dental midline onto the lower
+  one; `midline_shift_mm` per jaw (+ = patient left) moves a jaw's midline.
 - Posterior crossbite: expand the upper arch (`expand_premolar_mm`, `expand_molar_mm`).
 - Class II/III molar relationships need elastics or extractions; report them, do not plan them.
 - Implants, crowned or ankylosed teeth: `[teeth."NN"] fixed = true`.

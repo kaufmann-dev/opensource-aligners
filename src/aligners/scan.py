@@ -1,7 +1,7 @@
 """Intraoral scan loading and arch-frame detection.
 
-Arch frame: right-handed, origin at the dental midline (incisal level), +z occlusal (toward the
-opposing arch), +y anterior, +x = y x z. So +x is patient-right in the lower jaw and
+Arch frame: right-handed, origin at the dental midline (incisal level), +z normal to the
+occlusal plane through the tooth tips (toward the opposing arch), +y anterior, +x = y x z. So +x is patient-right in the lower jaw and
 patient-left in the upper jaw.
 """
 
@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import trimesh
+from numpy.typing import NDArray
 
 from aligners.case import CaseError
 from aligners.fdi import Jaw
@@ -102,6 +103,32 @@ def arch_frame(mesh: trimesh.Trimesh) -> tuple[Array, dict[str, Any]]:
     x, y, z = orthonormal_frame(occlusal, anterior)
     to_arch = np.linalg.inv(frame_matrix(origin, x, y, z))
     return to_arch, {"symmetry_rmse_mm": rmse, "boundary_loops": len(loops)}
+
+
+def cusp_plane_leveling(mesh: trimesh.Trimesh, labels: NDArray[np.int64]) -> tuple[Array, float]:
+    """Rotation (arch frame, about the origin) that makes +z the normal of the plane through
+    the tooth tips, keeping +y anterior; and its angle in degrees.
+
+    The scan's PCA axis is tilted by the gingiva, palate and floor of the mouth (up to ~15
+    deg), while the occlusal plane is what the insertion direction, leveling, bite metrics
+    and the frontal view refer to."""
+    V = np.asarray(mesh.vertices, dtype=np.float64)
+    F = np.asarray(mesh.faces)
+    z = np.array([0.0, 0.0, 1.0])
+    teeth = [np.unique(F[labels == n]) for n in np.unique(labels) if n > 0]
+    if len(teeth) < 6:
+        return np.eye(4), 0.0
+    for _ in range(3):
+        tips = []
+        for idx in teeth:
+            h = V[idx] @ z
+            tips.append(V[idx][h >= np.quantile(h, 0.97)].mean(axis=0))
+        _, _, axes = pca(np.array(tips))
+        z = axes[:, 2] * np.sign(axes[2, 2])
+    x, y, z = orthonormal_frame(z, np.array([0.0, 1.0, 0.0]))
+    R = np.eye(4)
+    R[:3, :3] = np.vstack([x, y, z])
+    return R, float(np.degrees(np.arccos(np.clip(z[2], -1.0, 1.0))))
 
 
 def scanner_bite(

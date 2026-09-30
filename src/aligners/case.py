@@ -84,6 +84,10 @@ PLAN_DEFAULTS: dict[str, Any] = {
     "goals": {
         "align": True,
         "derotate": True,
+        "tipping": True,
+        "tipping_pivot": 0.7,
+        "harmonize_inclination": True,
+        "level_incisal_edges": True,
         "level": True,
         "spee_flatten": 0.0,
         "close_spaces": True,
@@ -99,11 +103,12 @@ PLAN_DEFAULTS: dict[str, Any] = {
         "ipr_max_total_mm": 3.0,
         "bite": {
             "min_overjet_mm": 0.5,
+            "min_overbite_mm": 1.0,
             "enforce": False,
             "overjet_mm": 2.5,
             "overbite_mm": 2.0,
             "overbite_split": 0.5,
-            "align_midlines": False,
+            "align_midlines": True,
         },
     },
     "teeth": {},
@@ -127,10 +132,14 @@ PLAN_TEMPLATE = """\
 [goals]
 align = true              # place teeth on a smooth ideal arch with touching contacts
 derotate = true           # turn each tooth so its mesiodistal axis follows the arch
+tipping = true            # move crowns outward/inward by tipping (changes inclination), not bodily
+tipping_pivot = 0.7       # tipping center: fraction of the root length below the gingival margin
+harmonize_inclination = true  # give left/right homologous teeth the same outward/inward inclination
+level_incisal_edges = true    # tip incisors so their incisal edges are horizontal (straight smile line)
 level = true              # bring cusp tips / incisal edges onto a smooth occlusal curve
 spee_flatten = 0.0        # 0 = keep curve of Spee depth, 1 = flatten it completely
 close_spaces = true       # close spacing by retracting incisors (within max_incisor_retract_mm)
-anchors = ["16", "17", "18", "26", "27", "28", "36", "37", "38", "46", "47", "48"]  # held teeth
+anchors = ["16", "17", "18", "26", "27", "28", "36", "37", "38", "46", "47", "48"]  # keep place and occlusion; follow the arch transversely (expansion); remove to align them fully
 expand_canine_mm = 0.0    # total intercanine width change (both sides together)
 expand_premolar_mm = 0.0  # total interpremolar width change
 expand_molar_mm = 0.0     # total intermolar width change (moves anchors transversely)
@@ -143,11 +152,12 @@ ipr_max_total_mm = 3.0         # per arch
 
 [goals.bite]              # the bite comes from bite-registered scans, else from the CT
 min_overjet_mm = 0.5      # always kept: upper incisors advance if the setup would go below this
-enforce = false           # true = also correct overjet/overbite/midlines to the targets below
+min_overbite_mm = 1.0     # always kept: incisors extrude (split below) if the bite would open
+enforce = false           # true = also correct overjet/overbite to the targets below
 overjet_mm = 2.5
 overbite_mm = 2.0
 overbite_split = 0.5      # share of overbite correction done by upper incisors
-align_midlines = false    # shift the upper anterior segment onto the lower dental midline
+align_midlines = true     # move the upper dental midline onto the lower one
 
 # Per-tooth overrides in the tooth's own frame, pivoting about its center of resistance.
 # Applied on top of the solved target. Signs: mesial + toward midline, buccal + labial,

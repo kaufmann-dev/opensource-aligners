@@ -3,7 +3,8 @@ import itertools
 import numpy as np
 import trimesh
 
-from aligners.segment import alpha_expansion, cleanup
+from aligners.anatomy import submesh
+from aligners.segment import alpha_expansion, cleanup, fill_enclosed_gum, snap_gumline
 
 
 def _energy(lab, unary, pairs, weights):
@@ -62,3 +63,40 @@ def test_cleanup_keeps_separate_large_gum_regions():
     labels = np.where(np.abs(z) < 1.0, 11, 0)  # a tooth belt splits the gum into two caps
     out, _ = cleanup(mesh, labels)
     assert np.all(out[z > 1.2] == 0) and np.all(out[z < -1.2] == 0)
+
+
+def test_snap_gumline_moves_the_boundary_onto_the_crease():
+    # "gingiva" plane with a "crown" bump; the crown meets the plane in a concave crease at
+    # r = 3 mm, and the initial labels spill 0.6 mm onto the gingiva
+    box = trimesh.creation.box(extents=(16.0, 16.0, 1.0))
+    fine = trimesh.remesh.subdivide_to_size(box.vertices, box.faces, 0.25)
+    v, faces = fine[0], fine[1]
+    top = v[:, 2] > 0.4
+    r = np.hypot(v[top, 0], v[top, 1])
+    v[top, 2] += np.where(r < 3.0, 4.0 * np.sqrt(np.clip(1 - (r / 3.0) ** 2, 0, 1)) + 0.3, 0.0)
+    mesh = trimesh.Trimesh(v, faces, process=False)
+    c = mesh.triangles_center
+    upper = c[:, 2] > 0.45
+    rc = np.hypot(c[:, 0], c[:, 1])
+    labels = np.where(upper & (rc < 3.6), 11, 0)
+    out = snap_gumline(mesh, labels)
+    ring = upper & (rc > 3.25) & (rc < 3.6)
+    assert np.mean(out[ring] == 0) > 0.9  # the spilled band returned to gingiva
+    assert np.all(out[upper & (rc < 2.5)] == 11)
+
+
+def test_fill_enclosed_gum_fills_holes_in_one_crown_only():
+    sphere = trimesh.creation.icosphere(subdivisions=4, radius=5.0)
+    mesh = submesh(sphere, sphere.triangles_center[:, 2] > -4.0)  # open at the bottom
+    c = mesh.triangles_center
+    labels = np.where(c[:, 2] > 0.0, 11, 0)
+    labels[(c[:, 2] > 0.0) & (c[:, 0] > 0)] = 21
+    hole = np.hypot(c[:, 0] - 2.5, c[:, 1]) < 1.0
+    hole &= c[:, 2] > 3.0
+    labels[hole] = 0  # gingiva island inside 21
+    between = (np.abs(c[:, 0]) < 0.6) & (np.abs(c[:, 2] - 4.0) < 0.6)
+    labels[between] = 0  # gingiva touching 11 and 21 stays
+    out = fill_enclosed_gum(mesh, labels)
+    assert np.all(out[hole] == 21)
+    assert np.all(out[between] == 0)
+    assert np.all(out[c[:, 2] < -1.0] == 0)

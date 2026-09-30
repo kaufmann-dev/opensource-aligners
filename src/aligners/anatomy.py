@@ -27,7 +27,8 @@ GUM_RES_MM = 0.1
 GUM_SOCKET_DROP_MM = 1.0
 CONTACT_HEIGHT_FRACTION = 0.4  # contacts are searched in the top 60 % of the crown
 ARCH_SMOOTHING = 1e-2  # smoothing-spline penalty of the ideal arch r(theta)
-ARCH_ROBUST_SCALE_MM = 1.5  # residual scale for down-weighting displaced teeth
+ARCH_ROBUST_SCALE_MM = 2.5  # residual scale for down-weighting grossly displaced teeth
+ARCH_INSIDE_WEIGHT = 0.1  # weight of points inside the arch (the arch hugs the outer teeth)
 
 
 class ArchCurve:
@@ -247,9 +248,9 @@ class ArchForm:
     """Ideal arch as a smooth polar curve r(theta) around a point inside the arch.
 
     theta = 0 points anteriorly (+y), positive toward +x. The base form is symmetric and
-    smooth (a robust regression, so displaced teeth lie off it); toward the held back teeth
-    it blends into each side's actual position (`side_offset`). Beyond the last teeth the
-    radius is held constant."""
+    smooth, fitted as an outer envelope of the teeth (lingually displaced teeth are brought
+    out to it); toward the held back teeth it blends into each side's actual position
+    (`side_offset`). Beyond the last teeth the radius is held constant."""
 
     center_y: float
     base: Any  # r(theta): symmetric smoothing spline
@@ -299,11 +300,14 @@ def fit_arch_form(
     th, rr, ww = th[order], rr[order], ww[order]
     keep = np.r_[True, np.diff(th) > 1e-4]
     th, rr, ww = th[keep], rr[keep], ww[keep]
-    robust = np.ones_like(rr)
+    # Outer envelope: points inside the curve (lingually displaced teeth) get little weight, so
+    # the arch follows the outermost teeth and crowding is resolved by bringing teeth out, not
+    # by pulling well-positioned ones in. Tukey weights still drop gross outliers.
     spline = make_smoothing_spline(th, rr, w=ww, lam=ARCH_SMOOTHING)
-    for _ in range(3):
+    for _ in range(6):
         res = rr - spline(th)
         robust = np.clip(1 - (res / (4.685 * ARCH_ROBUST_SCALE_MM)) ** 2, 0, 1) ** 2 + 1e-3
+        robust = np.where(res < 0, robust * ARCH_INSIDE_WEIGHT, robust)
         spline = make_smoothing_spline(th, rr, w=ww * robust, lam=ARCH_SMOOTHING)
     form = ArchForm(center_y, spline, 0.0, 0.0, {}, float(np.abs(theta).max()))
     anchors = {side: pts for side, pts in anchor_points.items() if len(pts)}
@@ -462,6 +466,23 @@ def incisal_axis(vertices: Array, o: Array) -> Array:
     top = vertices[h >= h.max() - 0.2 * (h.max() - h.min())]
     flat = top - np.outer((top - top.mean(axis=0)) @ o, o)
     return pca(flat)[2][:, 0]
+
+
+def incisal_edge(vertices: Array, m: Array, o: Array) -> Array:
+    """Direction of the visible incisal edge: the crest (highest crown points along o) across
+    the crown's mesiodistal extent, fitted as a line in the m-o plane; returned along +m."""
+    s, h = vertices @ m, vertices @ o
+    lo, hi = np.percentile(s, [15, 85])
+    bins = np.linspace(float(lo), float(hi), 9)
+    xs, crest = [], []
+    for a, b in zip(bins[:-1], bins[1:], strict=True):
+        sel = (s >= a) & (s < b)
+        if sel.any():
+            xs.append(0.5 * (a + b))
+            crest.append(h[sel].max())
+    slope = float(np.polyfit(xs, crest, 1)[0]) if len(xs) >= 2 else 0.0
+    e = m + slope * o
+    return e / np.linalg.norm(e)
 
 
 def facial_normal(solid: trimesh.Trimesh, n_patch_faces: int, o: Array, outward: Array) -> Array:

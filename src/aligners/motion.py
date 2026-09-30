@@ -91,3 +91,26 @@ def interpolate(tooth: Tooth, T: Array, s: float) -> Array:
     out[:3, :3] = R
     out[:3, 3] = tooth.cr + s * t - R @ tooth.cr
     return out
+
+
+def rotation_last_split(tooth: Tooth, T: Array) -> tuple[Array, Array]:
+    """Split a motion into phase A (translation, tip and torque about the CR) and phase B (the
+    remaining rotation about the long axis, done afterwards). Returns (A, B) with B @ A == T."""
+    rotvec = Rotation.from_matrix(T[:3, :3]).as_rotvec()
+    along = (rotvec @ tooth.o) * tooth.o
+    R_a = Rotation.from_rotvec(rotvec - along).as_matrix()
+    t = transform_points(T, tooth.cr[None])[0] - tooth.cr
+    A = np.eye(4)
+    A[:3, :3] = R_a
+    A[:3, 3] = tooth.cr + t - R_a @ tooth.cr
+    return A, T @ np.linalg.inv(A)
+
+
+def interpolate_about(center: Array, T: Array, s: float) -> Array:
+    """Fraction s of a pure rotation T that keeps `center` fixed."""
+    rotvec = Rotation.from_matrix(T[:3, :3]).as_rotvec()
+    R = Rotation.from_rotvec(np.clip(s, 0.0, 1.0) * rotvec).as_matrix()
+    out = np.eye(4)
+    out[:3, :3] = R
+    out[:3, 3] = center - R @ center
+    return out

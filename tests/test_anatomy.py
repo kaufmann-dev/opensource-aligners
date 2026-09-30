@@ -89,6 +89,19 @@ def test_incisal_axis_follows_a_rotated_incisal_edge():
     assert abs(np.dot(axis, expected)) > 0.99
 
 
+def test_incisal_edge_follows_a_sloped_edge_not_the_long_axis():
+    from aligners.anatomy import incisal_edge
+
+    # incisor-like crown whose incisal edge rises 1 mm over its 8 mm width toward +x
+    crown = trimesh.creation.box(extents=(8.0, 2.0, 10.0)).subdivide().subdivide().subdivide()
+    v = crown.vertices.copy()
+    top = v[:, 2] > 4.9
+    v[top, 2] += v[top, 0] / 8.0
+    crown.vertices = v
+    e = incisal_edge(v, np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0]))
+    assert abs(np.degrees(np.arctan2(e[2], e[0])) - np.degrees(np.arctan(1 / 8))) < 1.0
+
+
 def test_facial_normal_converges_on_a_rotated_canine_like_crown():
     from aligners.anatomy import facial_normal
 

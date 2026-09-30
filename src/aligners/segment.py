@@ -9,7 +9,7 @@ import numpy as np
 import trimesh
 from numpy.typing import NDArray
 from scipy import sparse
-from scipy.sparse.csgraph import connected_components
+from scipy.sparse.csgraph import connected_components, dijkstra
 from scipy.spatial import KDTree
 
 from aligners import fdi
@@ -28,6 +28,10 @@ MIN_ISLAND_MM2 = 5.0
 MIN_GUM_REGION_MM2 = 20.0
 MIN_CROWN_AREA_MM2 = 40.0  # smallest normal visible crown (lower incisor) is ~100 mm^2
 CROWN_BONE_MM = 2.0  # CT tooth surface closer to bone than this is root, not visible
+CREASE_SMOOTH_PASSES = 8  # Laplacian passes of the concavity measure
+GUMLINE_SIGMA_MM = 0.03  # concavity at which cutting along a crease becomes almost free
+SNAP_TOOTH_MM = 1.2  # deeper crown faces stay tooth (a cut along a fissure could drop a cusp)
+SNAP_GUM_MM = 1.5  # faces farther out on the gingiva than this stay gingiva
 
 Labels = NDArray[np.int64]
 
@@ -256,9 +260,86 @@ def render_segmentation(case: Case, jaw: Jaw) -> Path:
     )
 
 
+def concavity(mesh: trimesh.Trimesh) -> Array:
+    """Per-vertex H = (v - smooth(v)) . n in mm (uniform Laplacian smoothing); negative in
+    concave creases such as the gingival margin and interproximal lines."""
+    v = np.asarray(mesh.vertices)
+    e = np.asarray(mesh.edges_unique)
+    adj = _adjacency(len(v), e)
+    degree = np.maximum(np.asarray(adj.sum(axis=1)).ravel(), 1.0)
+    smooth = v.copy()
+    for _ in range(CREASE_SMOOTH_PASSES):
+        smooth = (adj @ smooth) / degree[:, None]
+    return np.einsum("ij,ij->i", v - smooth, np.asarray(mesh.vertex_normals))
+
+
+def snap_gumline(mesh: trimesh.Trimesh, labels: Labels) -> Labels:
+    """Move the tooth/gingiva boundary onto the gingival crease.
+
+    The CT-derived labels put the boundary about 0.5 mm onto the gingiva (the CT blurs the
+    tooth neck). A binary min-cut over the faces near the boundary, with edge costs that
+    almost vanish along concave creases, snaps it onto the real gumline. Faces deep inside
+    a crown stay tooth and faces far out on the gingiva stay gingiva."""
+    pairs = np.asarray(mesh.face_adjacency, dtype=np.int64)
+    edges = np.asarray(mesh.face_adjacency_edges)
+    v = np.asarray(mesh.vertices)
+    centers = np.asarray(mesh.triangles_center)
+    h = concavity(mesh)[edges].mean(axis=1)
+    length = np.linalg.norm(v[edges[:, 0]] - v[edges[:, 1]], axis=1)
+    cost = length * (np.exp(-((np.minimum(h, 0.0) / GUMLINE_SIGMA_MM) ** 2)) + 1e-3)
+    n = len(labels)
+    step = np.linalg.norm(centers[pairs[:, 0]] - centers[pairs[:, 1]], axis=1)
+    graph = sparse.csr_matrix(
+        (np.r_[step, step], (np.r_[pairs[:, 0], pairs[:, 1]], np.r_[pairs[:, 1], pairs[:, 0]])),
+        shape=(n, n),
+    )
+    tooth = labels > 0
+    crossing = tooth[pairs[:, 0]] != tooth[pairs[:, 1]]
+    if not crossing.any():
+        return labels
+    reach = max(SNAP_TOOTH_MM, SNAP_GUM_MM) + 0.5
+    dist = dijkstra(graph, indices=np.unique(pairs[crossing]), min_only=True, limit=reach)
+    signed = np.where(tooth, dist, -dist)  # + inside a crown
+    band = np.isfinite(signed)
+    keep_tooth = band & (signed >= SNAP_TOOTH_MM)
+    for value in np.unique(labels[tooth]):
+        own = band & (labels == value)
+        if own.any() and not (own & keep_tooth).any():
+            # a small crown keeps its deepest part, so it cannot vanish in the cut
+            keep_tooth |= own & (signed >= 0.6 * signed[own].max())
+    keep_gum = band & (signed <= -SNAP_GUM_MM)
+    nodes = np.flatnonzero(band)
+    index = np.full(n, -1)
+    index[nodes] = np.arange(len(nodes))
+    inner = band[pairs[:, 0]] & band[pairs[:, 1]]
+    g = maxflow.Graph[float]()
+    ids = g.add_nodes(len(nodes))
+    g.add_edges(index[pairs[inner, 0]], index[pairs[inner, 1]], cost[inner], cost[inner])
+    hard = 1e6
+    g.add_grid_tedges(
+        ids, np.where(keep_tooth[nodes], hard, 0.0), np.where(keep_gum[nodes], hard, 0.0)
+    )
+    g.maxflow()
+    snapped = tooth.copy()
+    snapped[nodes] = ~g.get_grid_segments(ids)
+    out = np.where(snapped, labels, 0)
+    grown = snapped & ~tooth
+    if grown.any():
+        # new crown faces take the label of the nearest face that was already that crown
+        _, _, nearest = dijkstra(
+            graph,
+            indices=np.flatnonzero(tooth & band),
+            min_only=True,
+            limit=reach,
+            return_predecessors=True,
+        )
+        out[grown] = labels[nearest[grown]]
+    return out
+
+
 def run_segment(case: Case) -> dict[str, Any]:
     from aligners.register import bite_disagreement, load_ct_teeth, register_jaw
-    from aligners.scan import arch_frame, load_scan, scanner_bite
+    from aligners.scan import arch_frame, cusp_plane_leveling, load_scan, scanner_bite
 
     inputs = case.config()["inputs"]
     case.require(case.ct_dir / "ct.json", "ct")
@@ -296,9 +377,17 @@ def run_segment(case: Case) -> dict[str, Any]:
             exposed = by_fdi[n].bone_dist[np.asarray(m.faces)].min(axis=1) > CROWN_BONE_MM
             crowns.append((n, m, submesh(m, exposed)))
         values, unary = ct_unaries(arch_mesh, crowns)
-        labels = refine(arch_mesh, values, unary)
+        labels = snap_gumline(arch_mesh, refine(arch_mesh, values, unary))
         labels, warnings = cleanup(arch_mesh, labels)
         labels, dropped = drop_partial_crowns(arch_mesh, labels)
+        labels = fill_enclosed_gum(arch_mesh, labels)
+        level, level_deg = cusp_plane_leveling(arch_mesh, labels)
+        scan_to_arch = level @ scan_to_arch
+        arch_mesh = transformed(arch_mesh, level)
+        ct_teeth = {
+            n: (level[:3, :3] @ ax, transformed(m, level)) for n, (ax, m) in ct_teeth.items()
+        }
+        frame_info["occlusal_leveling_deg"] = level_deg
         for n in dropped:
             ct_teeth.pop(n, None)
             warnings.append(
@@ -373,6 +462,29 @@ def drop_partial_crowns(mesh: trimesh.Trimesh, labels: Labels) -> tuple[Labels, 
             out[labels == n] = 0
             dropped.append(n)
     return out, dropped
+
+
+def fill_enclosed_gum(mesh: trimesh.Trimesh, labels: Labels) -> Labels:
+    """Gingiva islands inside one crown (e.g. where a dropped partial crown overlapped its
+    neighbor) become that crown; gingiva touching the scan's open edge or several teeth stays."""
+    pairs = np.asarray(mesh.face_adjacency, dtype=np.int64)
+    same = labels[pairs[:, 0]] == labels[pairs[:, 1]]
+    _, comp = connected_components(_adjacency(len(labels), pairs[same]), directed=False)
+    open_edge = np.zeros(len(labels), dtype=bool)
+    edges = np.sort(np.asarray(mesh.edges), axis=1)
+    _, index, counts = np.unique(edges, axis=0, return_inverse=True, return_counts=True)
+    open_edge[np.asarray(mesh.edges_face)[counts[index.ravel()] == 1]] = True
+    out = labels.copy()
+    cross = pairs[~same]
+    for c in np.unique(comp[labels == 0]):
+        inside = comp == c
+        if open_edge[inside].any():
+            continue
+        rim = cross[inside[cross[:, 0]] | inside[cross[:, 1]]].ravel()
+        around = np.unique(labels[rim[~inside[rim]]])
+        if len(around) == 1 and around[0] != 0:
+            out[inside] = around[0]
+    return out
 
 
 def relabel(case: Case, jaw: Jaw, mapping: dict[int, int]) -> dict[str, Any]:
