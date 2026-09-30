@@ -276,6 +276,11 @@ def run_export(case: Case, stages: str = "", jobs: int = 4) -> dict[str, Any]:
             tasks.append((str(case.root), jaw, s, "model"))
             tasks.append((str(case.root), jaw, s, "template" if s == 0 else "aligner"))
     write_json(case.work / "export_plan.json", export_plan)
+    if wanted is None:
+        # a full export replaces every stage file: stale stages of an older plan must not remain
+        for jaw in JAWS:
+            for old in (case.out / jaw).glob("*.stl"):
+                old.unlink()
     if jobs > 1:
         with ProcessPoolExecutor(max_workers=jobs, mp_context=_mp_context()) as pool:
             results = list(pool.map(_task, tasks))

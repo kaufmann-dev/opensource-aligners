@@ -9,7 +9,7 @@ from scipy.optimize import brentq
 
 from aligners import fdi
 from aligners.analyze import analyze_bite, arch_to_bite, contact_pairs, posed_teeth
-from aligners.anatomy import ArchCurve, JawAnatomy, Tooth, ideal_arch
+from aligners.anatomy import ArchCurve, ArchForm, JawAnatomy, Tooth, ideal_arch_form
 from aligners.case import Case, CaseError, write_json
 from aligners.fdi import Jaw
 from aligners.geometry import (
@@ -104,20 +104,10 @@ class JawSolver:
         dx = _side(n, self.jaw) * _expansion(self.goals, fdi.position(n))
         return translation(np.array([dx, 0.0, 0.0]))
 
-    def base_half(self) -> tuple[Array, list[int]]:
-        """Ideal arch control points (contact chain) with expansion applied."""
+    def base_form(self) -> ArchForm:
+        """Ideal arch through the contacts, with expansion, meeting the held teeth."""
         widen = {pos: _expansion(self.goals, pos) for pos in range(1, 9)}
-        fronts = [fdi.position(n) for n in self._front_anchors().values()]
-        return ideal_arch(self.teeth, widen, min(fronts) if fronts else 6)
-
-    def curve_for(self, half: Array, positions: list[int], delta: float) -> ArchCurve:
-        """Symmetric target arch; the incisors move by delta, tapering to 0 at the anchors.
-
-        `positions` are contact indices (0 = midline contact, k = contact k|k+1)."""
-        fronts = [fdi.position(n) for n in self._front_anchors().values()]
-        ref = min(fronts) if fronts else max(positions) + 2
-        w = np.clip(1 - np.asarray(positions) / max(ref - 1, 1), 0.0, 1.0)
-        return ArchCurve(half + np.stack([np.zeros_like(w), delta * w], axis=1))
+        return ideal_arch_form(self.teeth, widen, self.anchors)
 
     def midline_s(self, curve: ArchCurve, x_m: float) -> float:
         return float(curve.project(np.array([x_m, curve.point(0.0)[1]]))[0])
@@ -215,18 +205,18 @@ class JawSolver:
         right = patient_right_sign(self.jaw)
         shift = g["midline_shift_mm"][self.jaw]
         x_m = adjust.midline_x if adjust.midline_x is not None else -right * shift
-        half, positions = self.base_half()
+        form = self.base_form()
         warnings: list[str] = []
         poses = {n: self.anchor_pose(n) for n in self.anchors}
         if not g["align"]:
             poses.update({n: np.eye(4) for n in self.movable})
-            base = self.curve_for(half, positions, 0.0)
+            base = form.curve(0.0)
             return self._finish(JawSetup(self.jaw, poses, {}, base, 0.0, x_m, {}, warnings))
 
-        level = self._level_target(self.curve_for(half, positions, 0.0))
+        level = self._level_target(form.curve(0.0))
 
         def discrepancy(delta: float) -> dict[int, float]:
-            _, ends = self._walk(self.curve_for(half, positions, delta), x_m, level, adjust, {}, {})
+            _, ends = self._walk(form.curve(delta), x_m, level, adjust, {}, {})
             return {side: -end for side, end in ends.items()}
 
         def residual_of(D: dict[int, float]) -> tuple[dict[str, float], dict[int, float]]:
@@ -264,7 +254,7 @@ class JawSolver:
             fine = np.linspace(lo, hi, 161)
             delta = float(fine[np.argmin([cost(d) for d in fine])])
 
-        curve = self.curve_for(half, positions, delta)
+        curve = form.curve(delta)
         ipr, residual = residual_of(discrepancy(delta))
         spacing = {
             side: -r / (len(self.side_teeth(side)) + 0.5)

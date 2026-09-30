@@ -70,3 +70,40 @@ def test_arch_curve_projection_on_steep_legs():
     s0 = 35.0
     offset = curve.point(s0) + 1.0 * curve.outward(s0)[:2]
     assert abs(curve.project(offset)[0] - s0) < 0.05
+
+
+def _rotated(mesh: trimesh.Trimesh, degrees: float) -> trimesh.Trimesh:
+    m = mesh.copy()
+    m.apply_transform(trimesh.transformations.rotation_matrix(np.radians(degrees), [0, 0, 1]))
+    return m
+
+
+def test_incisal_axis_follows_a_rotated_incisal_edge():
+    from aligners.anatomy import incisal_axis
+
+    # incisor-like crown: wide mesiodistally (x), thin labiolingually (y), tall (z)
+    crown = trimesh.creation.box(extents=(8.0, 2.0, 10.0)).subdivide().subdivide()
+    crown = _rotated(crown, 25.0)
+    axis = incisal_axis(np.asarray(crown.vertices), np.array([0.0, 0.0, 1.0]))
+    expected = np.array([np.cos(np.radians(25)), np.sin(np.radians(25)), 0.0])
+    assert abs(np.dot(axis, expected)) > 0.99
+
+
+def test_facial_normal_converges_on_a_rotated_canine_like_crown():
+    from aligners.anatomy import facial_normal
+
+    # canine-like crown: near-round outline, but a broad flat labial face (+y)
+    cap = trimesh.creation.icosphere(subdivisions=4, radius=1.0)
+    cap.apply_scale([3.5, 3.75, 5.0])
+    v = cap.vertices.copy()
+    v[v[:, 1] > 0, 1] *= 0.55
+    cap.vertices = v
+    cap = submesh(cap, cap.triangles_center[:, 2] > -2.0)
+    for degrees in (15.0, 30.0, 45.0):
+        rotated = _rotated(cap, degrees)
+        solid = close_crown(rotated, np.array([0.0, 0.0, 1.0]))
+        b = facial_normal(
+            solid, len(rotated.faces), np.array([0.0, 0.0, 1.0]), np.array([0.0, 1.0, 0.0])
+        )
+        expected = np.array([-np.sin(np.radians(degrees)), np.cos(np.radians(degrees)), 0.0])
+        assert np.degrees(np.arccos(np.clip(np.dot(b, expected), -1, 1))) < 2.0

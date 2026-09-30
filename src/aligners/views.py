@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 import trimesh
 
-from aligners.analyze import arch_to_bite, posed_crown
+from aligners.analyze import arch_to_bite, posed_patch
 from aligners.anatomy import JawAnatomy
 from aligners.case import Case, CaseError, read_json
 from aligners.fdi import Jaw
@@ -32,7 +32,7 @@ def _crowns(
 ) -> list[Item]:
     items = []
     for n in anatomy.order():
-        mesh = posed_crown(anatomy, n, poses)
+        mesh = posed_patch(anatomy, n, poses)  # scanned surface only, no fabrication stub
         if T is not None:
             mesh = trimesh.Trimesh(
                 transform_points(T, np.asarray(mesh.vertices)), mesh.faces, process=False

@@ -7,7 +7,7 @@ import numpy as np
 import trimesh
 
 from aligners import fdi
-from aligners.anatomy import ArchCurve, JawAnatomy, Tooth, ideal_arch
+from aligners.anatomy import ArchCurve, JawAnatomy, Tooth, ideal_arch_form
 from aligners.case import Case, read_json, write_json
 from aligners.fdi import JAWS, Jaw
 from aligners.geometry import Array, MeshSDF, sample_surface, transform_points, transform_vectors
@@ -36,11 +36,6 @@ def posed_mesh(mesh: trimesh.Trimesh, T: Array) -> trimesh.Trimesh:
     return trimesh.Trimesh(
         transform_points(T, np.asarray(mesh.vertices)), mesh.faces, process=False
     )
-
-
-def posed_crown(anatomy: JawAnatomy, number: int, poses: Poses | None = None) -> trimesh.Trimesh:
-    """Fabrication crown (with the stub below the margin) at its pose."""
-    return posed_mesh(anatomy.crowns[number], (poses or {}).get(number, np.eye(4)))
 
 
 def posed_patch(anatomy: JawAnatomy, number: int, poses: Poses | None = None) -> trimesh.Trimesh:
@@ -106,7 +101,7 @@ def analyze_jaw(anatomy: JawAnatomy, poses: Poses | None = None) -> dict[str, An
         np.array([((teeth[n].mesial_contact + teeth[n].distal_contact) / 2)[:2] for n in order])
     )
     right = patient_right_sign(jaw)
-    ideal = ArchCurve(ideal_arch(teeth)[0])
+    ideal = ideal_arch_form(teeth).curve()
 
     # Space: on the ideal arch (symmetric anteriorly, meeting the first molars), walk each
     # side's teeth contact to contact from the arch midline and compare with where the first
