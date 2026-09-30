@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aligners"
+version = "0.1.0"
+description = "Experimental CLI: jaw scans and/or CT to staged, 3D-printable clear aligners (not for clinical use)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "libigl>=2.6,<2.7",
+  "meshlib>=3.1.4.297",
+  "numpy>=2",
+  "pillow>=11",
+  "pydicom>=3",
+  "pymaxflow>=1.3",
+  "rich>=14",
+  "scikit-image>=0.25",
+  "scipy>=1.14",
+  "simpleitk>=2.4",
+  "tomli-w>=1.1",
+  "torch>=2.6",
+  "trimesh>=4.5",
+  "typer>=0.15",
+  "vtk>=9.4",
+]
+
+[project.scripts]
+aligners = "aligners.cli:app"
+
+[dependency-groups]
+dev = ["pyright>=1.1.390", "pytest>=8", "ruff>=0.8"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aligners"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+include = ["src/aligners", "tests"]
+reportMissingTypeStubs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore:Setting the shape on a NumPy array:DeprecationWarning:skimage"]
