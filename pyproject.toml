@@ -19,7 +19,6 @@ dependencies = [
   "scipy>=1.14",
   "simpleitk>=2.4",
   "tomli-w>=1.1",
-  "torch>=2.6",
   "trimesh>=4.5",
   "typer>=0.15",
   "vtk>=9.4",
@@ -30,14 +29,6 @@ aligners = "aligners.cli:app"
 
 [dependency-groups]
 dev = ["pyright>=1.1.390", "pytest>=8", "ruff>=0.8"]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
-[tool.uv.sources]
-torch = { index = "pytorch-cpu" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aligners"]
