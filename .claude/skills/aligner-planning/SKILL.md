@@ -74,6 +74,8 @@ image tool.
   Lower incisors that would hit the upper ones push the upper front forward (up to
   `max_incisor_advance_mm`), then open the bite by intruding incisors (not below
   `min_overbite_mm`); new posterior interferences intrude the pair and its homologs a little.
+  If the upper front then has spaces (lower anterior teeth too wide, see `bolton_anterior_pct`),
+  the lower incisors advance less and lower anterior IPR takes over.
 - Spacing: `close_spaces = true`; retraction is capped by `max_incisor_retract_mm`. With a small
   overjet, do not retract upper incisors (keep `bite.min_overjet_mm`).
 - Deep bite: `spee_flatten` 0.3-0.6 on the lower arch, or `bite.enforce = true` with an

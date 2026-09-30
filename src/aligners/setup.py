@@ -28,6 +28,7 @@ INCISOR_COST = 0.1  # per mm of incisor advancement/retraction
 MAX_TIPPING_DEG = 12.0  # bucco-lingual crown movement done by tipping, the rest bodily
 MAX_BITE_DZ_MM = 0.6  # most a tooth is intruded to clear an occlusal interference
 BITE_ITERATIONS = 6  # setup re-solves for bite corrections
+COORDINATION_PASSES = 3  # bite settles, trading lower incisor advancement for IPR
 SPACING_REFINEMENTS = 3  # extra placement walks to distribute leftover space exactly
 IPR_STEP_MM = 0.05
 CONTACT_TOLERANCE_MM = 0.05
@@ -41,6 +42,7 @@ class Adjust:
     """Bite-driven adjustments to one jaw's solve."""
 
     delta: float | None = None  # fixed incisor advancement (mm)
+    max_delta: float | None = None  # upper bound on the incisor advancement (mm)
     midline_x: float | None = None  # fixed midline x in this arch frame
     anterior_dz: float = 0.0  # vertical incisor change along arch z (+ = occlusal)
     tooth_dz: dict[int, float] = field(default_factory=dict)  # per-tooth vertical correction
@@ -114,7 +116,7 @@ class JawSolver:
         self.movable = [n for n in self.order if n not in self.anchors]
         self.samples = {n: anatomy.enamel_samples(n, 800, seed=3) for n in self.order}
         self.sdfs = {n: MeshSDF.of(anatomy.contact_solids[n]) for n in self.order}
-        self._space_samples: dict[float, list[dict[int, float]]] = {}
+        self._space_samples: dict[tuple[float, float], list[dict[int, float]]] = {}
         self._anchor_poses: dict[int, Array] = {}
         self.inclination_target = self._inclination_targets()
         self.edges = {
@@ -289,6 +291,8 @@ class JawSolver:
 
         lo = -g["max_incisor_retract_mm"] if g["close_spaces"] else 0.0
         hi = g["max_incisor_advance_mm"]
+        if adjust.max_delta is not None:
+            hi = max(min(hi, adjust.max_delta), 0.0)
         if adjust.delta is not None:
             delta = float(np.clip(adjust.delta, -g["max_incisor_retract_mm"], hi))
             if abs(delta - adjust.delta) > 0.05:
@@ -302,7 +306,7 @@ class JawSolver:
             # Vertical bite corrections barely change arch length, so the samples are cached
             # per midline position across the bite loop's re-solves.
             grid = np.linspace(lo, hi, 5)
-            key = round(x_m, 3)
+            key = (round(x_m, 3), round(hi, 3))
             if key not in self._space_samples:
                 self._space_samples[key] = [discrepancy(d) for d in grid]
             samples = self._space_samples[key]
@@ -693,84 +697,107 @@ def run_setup(case: Case) -> dict[str, Any]:
     adjust_u, adjust_l = Adjust(), Adjust()
     initial = analyze_bite(anatomies["upper"], anatomies["lower"], to_bite)
     baseline = {(i["lower"], i["upper"]): i["depth_mm"] for i in initial["interferences"]}
-    for _ in range(BITE_ITERATIONS):
-        metrics = analyze_bite(
-            anatomies["upper"], anatomies["lower"], to_bite, {j: s.poses for j, s in setups.items()}
-        )
-        if "overjet_mm" not in metrics:
-            break
-        changed = False
-        if bite["enforce"]:
-            err = metrics["overbite_mm"] - bite["overbite_mm"]
-            if abs(err) > 0.1:
-                adjust_u.anterior_dz -= err * bite["overbite_split"]
-                adjust_l.anterior_dz -= err * (1 - bite["overbite_split"])
-                changed = True
-            if abs(bite["overjet_mm"] - metrics["overjet_mm"]) > 0.1:
-                adjust_u.delta = setups["upper"].delta + bite["overjet_mm"] - metrics["overjet_mm"]
-                changed = True
-        else:
-            if metrics["overjet_mm"] < bite["min_overjet_mm"] - 0.05:
-                adjust_u.delta = (
-                    setups["upper"].delta + bite["min_overjet_mm"] - metrics["overjet_mm"]
+
+    def settle_bite() -> None:
+        for _ in range(BITE_ITERATIONS):
+            metrics = analyze_bite(
+                anatomies["upper"],
+                anatomies["lower"],
+                to_bite,
+                {j: s.poses for j, s in setups.items()},
+            )
+            if "overjet_mm" not in metrics:
+                break
+            changed = False
+            if bite["enforce"]:
+                err = metrics["overbite_mm"] - bite["overbite_mm"]
+                if abs(err) > 0.1:
+                    adjust_u.anterior_dz -= err * bite["overbite_split"]
+                    adjust_l.anterior_dz -= err * (1 - bite["overbite_split"])
+                    changed = True
+                if abs(bite["overjet_mm"] - metrics["overjet_mm"]) > 0.1:
+                    adjust_u.delta = (
+                        setups["upper"].delta + bite["overjet_mm"] - metrics["overjet_mm"]
+                    )
+                    changed = True
+            else:
+                if metrics["overjet_mm"] < bite["min_overjet_mm"] - 0.05:
+                    adjust_u.delta = (
+                        setups["upper"].delta + bite["min_overjet_mm"] - metrics["overjet_mm"]
+                    )
+                    changed = True
+                if metrics["overbite_mm"] < bite["min_overbite_mm"] - 0.05:
+                    err = metrics["overbite_mm"] - bite["min_overbite_mm"]
+                    adjust_u.anterior_dz -= err * bite["overbite_split"]
+                    adjust_l.anterior_dz -= err * (1 - bite["overbite_split"])
+                    changed = True
+            if (
+                bite["align_midlines"]
+                and abs(metrics.get("midline_upper_vs_lower_left_mm", 0.0)) > 0.05
+            ):
+                # + means the upper midline lies to the patient's left; the upper arch frame's +x
+                # points to the patient's left, so the upper segment moves by the negative amount
+                adjust_u.midline_x = (
+                    setups["upper"].midline_x - metrics["midline_upper_vs_lower_left_mm"]
                 )
                 changed = True
-            if metrics["overbite_mm"] < bite["min_overbite_mm"] - 0.05:
-                err = metrics["overbite_mm"] - bite["min_overbite_mm"]
-                adjust_u.anterior_dz -= err * bite["overbite_split"]
-                adjust_l.anterior_dz -= err * (1 - bite["overbite_split"])
-                changed = True
-        if (
-            bite["align_midlines"]
-            and abs(metrics.get("midline_upper_vs_lower_left_mm", 0.0)) > 0.05
-        ):
-            # + means the upper midline lies to the patient's left; the upper arch frame's +x
-            # points to the patient's left, so the upper segment moves by the negative amount
-            adjust_u.midline_x = (
-                setups["upper"].midline_x - metrics["midline_upper_vs_lower_left_mm"]
-            )
-            changed = True
-        # new occlusal interferences: intrude both teeth of the pair (and their left/right
-        # counterparts, so the arch stays symmetric) by half the excess each, within a cap
-        front_excess = 0.0
-        for hit in metrics["interferences"]:
-            excess = hit["depth_mm"] - baseline.get((hit["lower"], hit["upper"]), 0.0) - 0.05
-            if (
-                excess > 0.05
-                and fdi.position(hit["lower"]) <= 3
-                and fdi.position(hit["upper"]) <= 3
-            ):
-                # lower incisors against the upper ones: bring the upper front along
-                front_excess = max(front_excess, excess)
-            elif excess > 0.05:
-                for adj, n, jaw in (
-                    (adjust_l, hit["lower"], "lower"),
-                    (adjust_u, hit["upper"], "upper"),
+            # new occlusal interferences: intrude both teeth of the pair (and their left/right
+            # counterparts, so the arch stays symmetric) by half the excess each, within a cap
+            front_excess = 0.0
+            for hit in metrics["interferences"]:
+                excess = hit["depth_mm"] - baseline.get((hit["lower"], hit["upper"]), 0.0) - 0.05
+                if (
+                    excess > 0.05
+                    and fdi.position(hit["lower"]) <= 3
+                    and fdi.position(hit["upper"]) <= 3
                 ):
-                    twin = fdi.fdi_number(jaw, not fdi.is_patient_right(n), fdi.position(n))
-                    for m in {n, twin}:
-                        adj.tooth_dz[m] = max(
-                            adj.tooth_dz.get(m, 0.0) - (excess / 2 + 0.05), -MAX_BITE_DZ_MM
-                        )
-                changed = True
-        if front_excess > 0:
-            # bring the upper front forward as far as allowed, then open the bite (intrude the
-            # incisors, keeping the minimum overbite): lower incisal edges that sit lower meet
-            # the upper palatal surfaces further labially
-            need = front_excess + 0.05
-            current = adjust_u.delta if adjust_u.delta is not None else setups["upper"].delta
-            advance = min(need, max(0.0, goals["max_incisor_advance_mm"] - current))
-            if advance > 0.01:
-                adjust_u.delta = current + advance
-                changed = True
-            spare = metrics["overbite_mm"] - bite["min_overbite_mm"]
-            if need - advance > 0.01 and spare > 0.05:
-                dz = min(2.0 * (need - advance), spare)
-                adjust_u.anterior_dz -= dz * bite["overbite_split"]
-                adjust_l.anterior_dz -= dz * (1 - bite["overbite_split"])
-                changed = True
-        if not changed:
+                    # lower incisors against the upper ones: bring the upper front along
+                    front_excess = max(front_excess, excess)
+                elif excess > 0.05:
+                    for adj, n, jaw in (
+                        (adjust_l, hit["lower"], "lower"),
+                        (adjust_u, hit["upper"], "upper"),
+                    ):
+                        twin = fdi.fdi_number(jaw, not fdi.is_patient_right(n), fdi.position(n))
+                        for m in {n, twin}:
+                            adj.tooth_dz[m] = max(
+                                adj.tooth_dz.get(m, 0.0) - (excess / 2 + 0.05), -MAX_BITE_DZ_MM
+                            )
+                    changed = True
+            if front_excess > 0:
+                # bring the upper front forward as far as allowed, then open the bite (intrude the
+                # incisors, keeping the minimum overbite): lower incisal edges that sit lower meet
+                # the upper palatal surfaces further labially
+                need = front_excess + 0.05
+                current = adjust_u.delta if adjust_u.delta is not None else setups["upper"].delta
+                advance = min(need, max(0.0, goals["max_incisor_advance_mm"] - current))
+                if advance > 0.01:
+                    adjust_u.delta = current + advance
+                    changed = True
+                spare = metrics["overbite_mm"] - bite["min_overbite_mm"]
+                if need - advance > 0.01 and spare > 0.05:
+                    dz = min(2.0 * (need - advance), spare)
+                    adjust_u.anterior_dz -= dz * bite["overbite_split"]
+                    adjust_l.anterior_dz -= dz * (1 - bite["overbite_split"])
+                    changed = True
+            if not changed:
+                break
+            setups["lower"] = solvers["lower"].solve(adjust_l)
+            setups["upper"] = solvers["upper"].solve(adjust_u)
+
+    for _ in range(COORDINATION_PASSES):
+        settle_bite()
+        # The upper front advanced to make room for the lower incisors and is left with spaces
+        # (the lower front is too wide for it, Bolton excess): advance the lower incisors less,
+        # so IPR in the lower front takes over, and settle the bite again. An incisor advance
+        # of d lengthens the arch by about 1.3 d.
+        spare = sum(max(0.0, -r) for r in setups["upper"].residual_mm.values())
+        lower_delta = setups["lower"].delta
+        if adjust_u.delta is None or spare < 0.3 or lower_delta <= 0.05:
             break
+        adjust_l.max_delta = max(0.0, lower_delta - spare / 1.3)
+        adjust_u.delta = None
+        adjust_u.anterior_dz = adjust_l.anterior_dz = 0.0  # the bite opening was for that advance
         setups["lower"] = solvers["lower"].solve(adjust_l)
         setups["upper"] = solvers["upper"].solve(adjust_u)
     result["jaws"] = {jaw: _jaw_report(anatomies[jaw], s) for jaw, s in setups.items()}
