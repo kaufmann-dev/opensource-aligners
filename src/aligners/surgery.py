@@ -786,27 +786,48 @@ def surgery_report(
     return report
 
 
-def landmarks_document(case: Case, report: dict[str, Any]) -> dict[str, Any]:
-    """Named pre-op landmarks in CT LPS and head coordinates: the contract other planning
-    software uses to express a plan as a movement table (evaluate its transforms here)."""
+LANDMARKS_RULE = (
+    "Move each landmark's ct_lps point with the bone segment that contains it in the CT image, "
+    "then d = moved point - reference_lps (mm, LPS). forward_mm = d . y_anterior, "
+    "up_mm = d . z_superior, left_mm = -(d . x_patient_right). Write the values as "
+    "[surgery.maxilla] / [surgery.mandible] tables of plan.toml, rounded to 0.1 mm."
+)
+
+
+def landmarks_document(report: dict[str, Any]) -> dict[str, Any]:
+    """The contract other planning software uses to express its plan as a movement table.
+
+    `reference_lps` is where a displacement is measured from (scanned teeth, mandible in
+    occlusion); `ct_lps` is where that point lies on the bone in the CT image. They differ for
+    the mandible when the CT was taken in another bite than the scans."""
     H = np.asarray(report["ct_to_head"], float)
-    inv = np.linalg.inv(H)
+    head_to_ct = np.linalg.inv(H)
+    bone_to_head = {
+        "upper": H,
+        "lower": np.asarray(report["mandible_bone_to_head"], float),
+    }
     out: dict[str, Any] = {
         "format": "aligners-surgery-landmarks",
         "version": 1,
-        "head_frame_in_ct_lps": {
-            "origin": inv[:3, 3],
-            "x_patient_right": inv[:3, 0],
-            "y_anterior": inv[:3, 1],
-            "z_superior": inv[:3, 2],
+        "coordinates": "DICOM patient LPS mm of the CT",
+        "head_frame": {
+            "origin": head_to_ct[:3, 3],
+            "x_patient_right": head_to_ct[:3, 0],
+            "y_anterior": head_to_ct[:3, 1],
+            "z_superior": head_to_ct[:3, 2],
         },
+        "head_pitch_deg": report["head_pitch_deg"],
+        "rule": LANDMARKS_RULE,
         "jaws": {},
-        "note": "dental landmarks at their scanned positions; the mandible in occlusion",
     }
     for jaw, bone in BONE.items():
-        lm = {k: np.asarray(v, float) for k, v in report["landmarks_scanned_head"][jaw].items()}
+        to_ct = np.linalg.inv(bone_to_head[jaw])
         out["jaws"][bone] = {
-            k: {"ct_lps": transform_points(inv, v[None])[0], "head": v} for k, v in lm.items()
+            name: {
+                "reference_lps": transform_points(head_to_ct, np.asarray(h, float)[None])[0],
+                "ct_lps": transform_points(to_ct, np.asarray(h, float)[None])[0],
+            }
+            for name, h in report["landmarks_scanned_head"][jaw].items()
         }
     return out
 

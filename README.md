@@ -107,7 +107,9 @@ Outputs are written to `cases/me/out/`:
 - surgical modes, in `surgery/`:
   - `movements.toml`: the planned movements in the `plan.toml` input format;
   - `movements.json`: tables, angles, transforms, split gaps;
-  - `landmarks.json`: named landmarks in CT and head coordinates, for other planning software;
+  - `landmarks.json`: named landmarks in CT coordinates, the head frame and the rule for turning
+    another planner's plan into a movement table. bimax-simulation's *Export aligner movements*
+    uses it;
   - STLs of the maxilla, mandible segments, cranium and teeth before/after surgery, in CT DICOM
     (LPS) coordinates.
 

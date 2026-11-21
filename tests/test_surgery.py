@@ -253,3 +253,45 @@ def test_occlusion_recovers_the_ideal_relation():
     angle = np.degrees(Rotation.from_matrix(X[:3, :3] @ X_TRUE[:3, :3].T).magnitude())
     assert angle < 0.5
     assert metrics["max_penetration_mm"] < 0.2 and not metrics["warnings"]
+
+
+def test_landmarks_contract_reproduces_the_movement_table():
+    """Another planner following landmarks.json's rule writes aligners' own table, also when
+    the CT mandible is in another bite than the occlusion of the scans."""
+    from aligners.surgery import landmarks_document
+
+    rng = np.random.default_rng(5)
+
+    def rigid(angle: float, shift: float) -> np.ndarray:
+        T = np.eye(4)
+        T[:3, :3] = Rotation.from_rotvec(rng.normal(size=3) * angle).as_matrix()
+        T[:3, 3] = rng.normal(size=3) * shift
+        return T
+
+    H, B = rigid(0.3, 50.0), rigid(0.3, 50.0)  # CT->head; CT-image mandible -> head (occluded)
+    M = {"maxilla": rigid(0.05, 3.0), "mandible": rigid(0.05, 3.0)}
+    scanned = {"upper": PRE, "lower": {k: v - [0.0, 2.0, 10.0] for k, v in PRE.items()}}
+    report = {
+        "ct_to_head": H,
+        "mandible_bone_to_head": B,
+        "head_pitch_deg": 0.0,
+        "landmarks_scanned_head": scanned,
+    }
+    doc = landmarks_document(report)
+    frame = doc["head_frame"]
+    head_to_ct = np.linalg.inv(H)
+    # what the planner holds: CT-image -> post-op LPS transforms of its bone segments
+    planner = {
+        "maxilla": head_to_ct @ M["maxilla"] @ H,
+        "mandible": head_to_ct @ M["mandible"] @ B,
+    }
+    for jaw, bone in (("upper", "maxilla"), ("lower", "mandible")):
+        expected = transform_to_table(M[bone], scanned[jaw])
+        for name, entry in doc["jaws"][bone].items():
+            d = transform_points(planner[bone], entry["ct_lps"][None])[0] - entry["reference_lps"]
+            got = {
+                "forward_mm": round(float(d @ frame["y_anterior"]), 1) + 0.0,
+                "up_mm": round(float(d @ frame["z_superior"]), 1) + 0.0,
+                "left_mm": round(float(-(d @ frame["x_patient_right"])), 1) + 0.0,
+            }
+            assert got == expected[name]

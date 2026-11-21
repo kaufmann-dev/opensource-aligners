@@ -260,7 +260,7 @@ def export_surgery(case: Case, report: dict[str, Any]) -> list[str]:
     out.mkdir(parents=True, exist_ok=True)
     (out / "movements.toml").write_text(movements_toml(report))
     write_json(out / "movements.json", report)
-    write_json(out / "landmarks.json", landmarks_document(case, report))
+    write_json(out / "landmarks.json", landmarks_document(report))
     head_to_ct = np.linalg.inv(np.asarray(report["ct_to_head"], float))
     names = {
         "maxilla": ("maxilla_pre", "maxilla_post"),
