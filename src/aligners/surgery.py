@@ -196,16 +196,17 @@ def movement_angles(M: Array) -> dict[str, float]:
 
 
 def incisor_target_axes(
-    anatomies: dict[Jaw, JawAnatomy], cfg: dict[str, Any]
+    anatomies: dict[Jaw, JawAnatomy], degrees: dict[str, float]
 ) -> dict[Jaw, dict[int, Array]]:
-    """Decompensated crownward incisor axes in each arch frame: tilted labially by the target
-    inclination from the perpendicular to the arch's own occlusal plane."""
+    """Target crownward axes of the incisors whose long axis the CT gives, in each arch frame:
+    tilted labially by the target inclination from the perpendicular to the arch's own occlusal
+    plane. (Without the CT the inclination is unknown, so there is nothing to correct.)"""
     out: dict[Jaw, dict[int, Array]] = {}
-    for jaw, key in (("upper", "upper_incisor_deg"), ("lower", "lower_incisor_deg")):
-        a = np.radians(cfg[key])
+    for jaw in ("upper", "lower"):
+        a = np.radians(degrees[jaw])
         axes = {}
         for n, t in anatomies[jaw].teeth.items():
-            if fdi.position(n) > 2:
+            if fdi.position(n) > 2 or not t.root_from_ct:
                 continue
             b = np.array([t.b[0], t.b[1], 0.0])
             b /= np.linalg.norm(b)

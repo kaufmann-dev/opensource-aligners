@@ -96,6 +96,7 @@ PLAN_DEFAULTS: dict[str, Any] = {
         "expand_premolar_mm": 0.0,
         "expand_molar_mm": 0.0,
         "midline_shift_mm": {"upper": 0.0, "lower": 0.0},
+        "incisor_inclination_deg": {"upper": 30.0, "lower": 15.0},
         "max_incisor_advance_mm": 1.5,
         "max_incisor_retract_mm": 2.0,
         "ipr_max_anterior_mm": 0.3,
@@ -116,11 +117,7 @@ PLAN_DEFAULTS: dict[str, Any] = {
     "surgery": {
         "mode": "none",
         "pitch_deg": 0.0,
-        "auto": {
-            "move": "mandible",
-            "upper_incisor_deg": 30.0,
-            "lower_incisor_deg": 15.0,
-        },
+        "auto": {"move": "mandible"},
         "maxilla": {},
         "mandible": {},
     },
@@ -154,14 +151,18 @@ harmonize_inclination = true  # give left/right homologous teeth the same outwar
 harmonize_incisal_edges = true  # tip incisors so left and right incisal edges mirror each other
 level = true              # bring cusp tips / incisal edges onto a smooth occlusal curve
 spee_flatten = 0.0        # 0 = keep curve of Spee depth, 1 = flatten it completely
-close_spaces = true       # close spacing by retracting incisors (within max_incisor_retract_mm)
+close_spaces = true       # close spacing by retracting incisors without a CT long axis
 anchors = ["16", "17", "18", "26", "27", "28", "36", "37", "38", "46", "47", "48"]  # keep place and occlusion; follow the arch transversely (expansion); remove to align them fully
 expand_canine_mm = 0.0    # total intercanine width change (both sides together)
 expand_premolar_mm = 0.0  # total interpremolar width change
 expand_molar_mm = 0.0     # total intermolar width change (moves anchors transversely)
 midline_shift_mm = { upper = 0.0, lower = 0.0 }  # + = toward patient-left
-max_incisor_advance_mm = 1.5   # incisor proclination allowed to resolve crowding
-max_incisor_retract_mm = 2.0   # incisor retraction allowed to close spaces
+incisor_inclination_deg = { upper = 30.0, lower = 15.0 }  # incisor axis vs the perpendicular to
+                          # the occlusal plane, + = labial (needs the CT long axis). Incisors are
+                          # torqued to it and the arch runs through them; the lower front stays
+                          # back only as far as bite.min_overjet_mm needs
+max_incisor_advance_mm = 1.5   # how far the incisors may come forward (inclination, crowding, bite)
+max_incisor_retract_mm = 2.0   # how far they may go back (inclination, closing spaces)
 ipr_max_anterior_mm = 0.3      # interproximal reduction per contact, incisors/canines
 ipr_max_posterior_mm = 0.5     # per contact, premolars/molars
 ipr_max_total_mm = 3.0         # per arch
@@ -195,14 +196,12 @@ mode = "none"             # "none" = orthodontics only: teeth fit the current ja
 pitch_deg = 0.0           # movement-frame horizontal vs the upper occlusal plane, + = anterior up
                           # (e.g. to report in the frame of a surgeon's planning software)
 
-# Auto mode aligns each arch on its own jaw with the incisors at their target inclinations (no
-# compensation for the other jaw), then moves one jaw into the ideal occlusion: bite.overjet_mm,
-# coinciding midlines, Class I canines and molars, seated back teeth. It reports that movement.
-# bite.enforce, bite.min_overjet_mm and bite.align_midlines are not used in auto mode.
+# Auto mode aligns each arch on its own jaw with the incisors at goals.incisor_inclination_deg
+# (no compensation for the other jaw), then moves one jaw into the ideal occlusion:
+# bite.overjet_mm, coinciding midlines, Class I canines and molars, seated back teeth. It reports
+# that movement. bite.enforce, bite.min_overjet_mm and bite.align_midlines are not used in auto.
 [surgery.auto]
 move = "mandible"         # the jaw that moves ("mandible" or "maxilla"); the other stays
-upper_incisor_deg = 30.0  # upper incisor axis vs the perpendicular to the occlusal plane, + = labial
-lower_incisor_deg = 15.0  # lower incisor axis vs the perpendicular to the occlusal plane, + = labial
 
 # Manual mode: landmark displacements from the surgical plan (e.g. the rows of a ProPlan CMF
 # point table), mm in the movement frame: forward_mm + anterior, up_mm + superior, left_mm +

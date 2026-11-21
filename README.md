@@ -29,12 +29,13 @@ aligners for every stage.
 4. **Setup**: solves the target tooth positions from treatment goals in `plan.toml`.
    - It uses a smooth, symmetric ideal arch through the current incisors and the held molars,
      fitted robustly so that displaced teeth come onto the arch of the others. Each tooth type
-     keeps its natural in/out offset. Incisor advancement comes before IPR.
-   - It corrects inclination by tipping and mirrors the incisal edges left to right. It aligns
-     the midlines, each arch moving half.
-   - It keeps minimum overjet/overbite and clears occlusal interferences.
-   - It coordinates both arches: lower IPR replaces proclination when the upper front would be
-     left with spaces.
+     keeps its natural in/out offset.
+   - It torques the incisors to their target inclinations (CT long axis) and runs the arch
+     through them. IPR resolves the crowding that remains.
+   - It corrects other inclinations by tipping and mirrors the incisal edges left to right. It
+     aligns the midlines, each arch moving half.
+   - It keeps minimum overjet/overbite and clears occlusal interferences. When the upper front
+     cannot come far enough forward, the lower front stays back by the rest.
 5. **Surgery (optional)**: plans the teeth for a jaw movement after orthognathic surgery, with
    orthodontics before surgery. Only the teeth are used.
    - `auto` aligns each arch on its own jaw, with the incisors at their target inclinations

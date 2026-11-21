@@ -43,6 +43,7 @@ FIT_NEAR_MM = 1.5  # CT surface this close to the scanned crown, facing the same
 FIT_RIM_MM = 0.4  # ... unless it meets the scan at the patch's open rim
 HIDDEN_CLEAR_MM = 0.3  # completed crown surface farther than this from the scan: missed enamel
 SOLID_RES_MM = 0.15  # grid of the completed crown solids
+SCAN_BAND_MM = 0.3  # closed scans count this close to the scanned surface (and inside the CT)
 SOLID_FACES = 20000
 ARCH_KNOTS_MM = np.array([0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 36.0, 44.0, 54.0])
 ARCH_LENGTH_MM = 80.0  # half-arch length built from the midline (beyond every tooth)
@@ -313,6 +314,7 @@ def _claim(own: Array, points: Array, neighbors: list[Neighbor]) -> Array:
 
 
 def complete_crowns(
+    patch: trimesh.Trimesh,
     crown: trimesh.Trimesh,
     solid: trimesh.Trimesh,
     fit: trimesh.Trimesh,
@@ -320,9 +322,10 @@ def complete_crowns(
     enamel: Callable[[Array], Array],
     neighbors: list[Neighbor],
 ) -> tuple[trimesh.Trimesh, trimesh.Trimesh]:
-    """The closed scanned crown (with stub) and solid (closed at the margin) each united with
-    the fitted CT tooth where it belongs to this tooth: the crown where floor(p) < 0, the solid
-    where enamel(p) < 0."""
+    """The closed scanned crown (with stub) and solid (closed at the margin) completed by the
+    fitted CT tooth where it belongs to this tooth: the crown where floor(p) < 0, the solid
+    where enamel(p) < 0. The closed scans count only near the scanned surface or inside the CT
+    tooth, so their caps across what the scan missed give way to the CT's shape."""
     V = np.asarray(fit.vertices)
     kept = V[floor(V) < 0]
     pad = 2 * SOLID_RES_MM
@@ -331,9 +334,11 @@ def complete_crowns(
     P, shape = grid_points(lo, hi, SOLID_RES_MM)
     f = MeshSDF.of(fit)(P, bound=1.0)
     part = np.maximum(f, _claim(f, P, neighbors))
+    trusted = np.minimum(MeshSDF.of(patch).unsigned(P) - SCAN_BAND_MM, f)
     out = []
     for closed, region in ((crown, floor), (solid, enamel)):
-        d = np.minimum(MeshSDF.of(closed)(P, bound=1.0), np.maximum(part, region(P)))
+        scanned = np.maximum(MeshSDF.of(closed)(P, bound=1.0), trusted)
+        d = np.minimum(scanned, np.maximum(part, region(P)))
         mesh = level_set(d.reshape(shape), lo, SOLID_RES_MM)
         out.append(decimate(mesh, SOLID_FACES, max_error=0.02))
     return out[0], out[1]
@@ -860,7 +865,7 @@ def build_anatomy(
                 Neighbor(scanned[m], fitted.get(m)) for m in order[max(i - 1, 0) : i + 2] if m != n
             ]
             crown, solid = complete_crowns(
-                crown, solid, fits[n], below_plane(floor, tooth.o), gum.above, neighbors
+                patches[n], crown, solid, fits[n], below_plane(floor, tooth.o), gum.above, neighbors
             )
         if ct_mesh is not None:
             write_mesh(out_dir / f"{n}_root.ply", ct_mesh)

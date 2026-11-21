@@ -64,9 +64,14 @@ image tool.
 - How the solver makes space: the ideal arch is smooth and symmetric, runs through the current
   incisors and meets the held molars; it is fitted robustly, so displaced teeth come onto the
   arch of the others, and each tooth type keeps its natural in/out offset (left/right mean,
-  at most 1 mm). Incisors advance up to `max_incisor_advance_mm` (measured from where they
-  are), and IPR is used only for what remains (and by `stage` where a derotating tooth cannot
-  pass its neighbor otherwise). Bucco-lingual moves are done by tipping (`tipping`,
+  at most 1 mm). Incisors with a CT long axis are torqued to `incisor_inclination_deg`
+  (default upper 30 / lower 15, the Downs norms) and the arch runs through them, so they never
+  end up retroclined to save IPR; crowding left is resolved by IPR (and by `stage` where a
+  derotating tooth cannot pass its neighbor otherwise), spacing left stays as small spaces.
+  Without a CT axis, incisors advance up to `max_incisor_advance_mm` (measured from where
+  they are) before IPR is used. Lower `incisor_inclination_deg.lower` to camouflage a Class
+  III (retroclined lower incisors, more IPR), raise `.upper` for a Class II. Bucco-lingual
+  moves are done by tipping (`tipping`,
   `tipping_pivot`), so inclinations change; `harmonize_inclination` gives left/right
   homologous teeth the same inclination, and `harmonize_incisal_edges` tips the incisors so
   left and right incisal edges mirror each other (not forced horizontal).
@@ -80,10 +85,11 @@ image tool.
   Lower incisors that would hit the upper ones push the upper front forward (up to
   `max_incisor_advance_mm`), then open the bite by intruding incisors (not below
   `min_overbite_mm`); new posterior interferences intrude the pair and its homologs a little.
-  If the upper front then has spaces (lower anterior teeth too wide, see `bolton_anterior_pct`),
-  the lower incisors advance less and lower anterior IPR takes over.
-- Spacing: `close_spaces = true`; retraction is capped by `max_incisor_retract_mm`. With a small
-  overjet, do not retract upper incisors (keep `bite.min_overjet_mm`).
+  When even the fully advanced upper front cannot keep `min_overjet_mm`, the lower front stays
+  back by the rest (compensation). Upper spaces left by a too-wide lower front (see
+  `bolton_anterior_pct`) can be closed by lowering `incisor_inclination_deg.lower`.
+- Spacing without a CT axis: `close_spaces = true`; retraction is capped by
+  `max_incisor_retract_mm`. With a small overjet, do not retract upper incisors.
 - Deep bite: `spee_flatten` 0.3-0.6 on the lower arch, or `bite.enforce = true` with an
   `overbite_mm` target. Open bite: `bite.enforce` with a positive overbite target.
 - Overjet: `bite.enforce = true`, `overjet_mm` 2-3.
@@ -111,9 +117,8 @@ tilts it, + = anterior up).
   (`incisor_inclination_deg`). The surgeon decides; you only plan the teeth for their plan.
 - `mode = "auto"`:
   - Each arch is aligned on its own jaw: no compensation for the other jaw, incisors torqued
-    to `upper_incisor_deg` / `lower_incisor_deg` (axis vs the occlusal-plane perpendicular,
-    norms ~30 / ~15). If setup warns "incisor decompensation needs … limited", raise
-    `max_incisor_advance_mm` / `max_incisor_retract_mm` or adjust the targets.
+    to `goals.incisor_inclination_deg`. If setup warns "incisor inclination needs … limited",
+    raise `max_incisor_advance_mm` / `max_incisor_retract_mm` or adjust the targets.
   - The solver then moves one jaw (`move`, default the mandible) into the ideal occlusion:
     `bite.overjet_mm`, coinciding midlines, Class I canines, then molars, seated back teeth.
     The result is how far that jaw must move (forward/back, sideways, up/down) and rotate

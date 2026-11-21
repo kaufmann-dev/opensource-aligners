@@ -18,6 +18,7 @@ from aligners.motion import decompose
 TOOTH_FACES = 5000
 ROOT_FACES = 2500
 FILL_FACES = 3000
+FILL_BELOW_MARGIN_MM = 1.0
 GUM_FACES = 60000
 GUM_FOLLOW_MM = 3.0
 
@@ -82,9 +83,13 @@ def build_preview(case: Case) -> str:
             }
             if n in anatomy.roots:
                 entry["root"] = _pack(decimate(anatomy.roots[n], ROOT_FACES, max_error=0.1))
-            # the completed crown, drawn just behind the scanned one: it shows only where the
-            # scan saw nothing, e.g. enamel a crowded neighbor hid that derotation exposes
-            entry["fill"] = _pack(decimate(anatomy.contact_solids[n], FILL_FACES, max_error=0.05))
+            # the completed crown down to just below the margin, drawn just behind the scanned
+            # one: it shows only where the scan saw nothing, e.g. enamel a crowded neighbor hid
+            # that derotation exposes
+            crown = anatomy.crowns[n]
+            height = (np.asarray(crown.triangles_center) - t.margin_center) @ t.o
+            fill = submesh(crown, height > -FILL_BELOW_MARGIN_MM)
+            entry["fill"] = _pack(decimate(fill, FILL_FACES, max_error=0.05))
             teeth[str(n)] = entry
         # everything in the scanned lower arch frame; surgical modes also show the jaws after
         group = np.eye(4) if not to_bite else np.linalg.inv(to_bite["lower"]) @ to_bite[jaw]
