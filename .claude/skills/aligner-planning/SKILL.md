@@ -136,8 +136,9 @@ the teeth; `analyze` then reports `face` in the head frame (+x patient right, +y
   - `split_gap_mm` (+ gap, − overlap at the sagittal splits) and `chin_mm`;
   - `check` warnings: `surgery_magnitude`, `chin` (genioplasty is not planned),
     `split_overlap`, `surgery_fit`.
-- A plan made in bimax-simulation: its *Export aligner movements* (given this case's
-  `out/surgery/landmarks.json`, same CT) writes the manual tables directly.
+- A plan made in bimax-simulation (same CT): write the manual tables directly with
+  `bimax-cli export-aligners PLAN.bimax --scenario NAME --landmarks out/surgery/landmarks.json
+  --out movements.toml` (or *Export aligner movements* in its app).
 - Hand the surgeon `out/surgery/movements.toml` (the same format as the manual input),
   `movements.json` and the STLs (DICOM LPS coordinates, overlay on the CT). If they change the
   plan, paste their values into `plan.toml` with `mode = "manual"` and rerun.
