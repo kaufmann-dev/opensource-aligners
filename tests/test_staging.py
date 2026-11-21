@@ -55,6 +55,7 @@ def test_collision_is_resolved_by_delaying_the_tooth_moving_into_its_neighbor():
         {},
         gum,
         {44: pa, 45: pb},
+        {44: close_crown(pa, ta.o, stub=False), 45: close_crown(pb, tb.o, stub=False)},
     )
     targets = {
         44: compose(ta, Movement(mesial=-1.0)),  # moves +x into 45's current place (4 stages)

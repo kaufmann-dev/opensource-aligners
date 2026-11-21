@@ -16,6 +16,12 @@ aligners for every stage.
    teeth onto the scan and labels every scan face with its FDI tooth number (0 = gingiva).
    - The tooth/gingiva boundary is snapped onto the gingival crease, and every boundary between
      two touching crowns onto their interproximal crease.
+   - Each tooth gets a frame from its own crown: incisors along the incisal edge, canines along
+     the cusp ridges, premolars and molars between their contacts. Where a crowded canine
+     touches its neighbors says little about how it is turned.
+   - Crown surface the scan could not see, for example enamel hidden behind a crowded
+     neighbor, is completed from the CT tooth fitted to the scan. Contacts, collisions, the
+     printed models and the preview use these completed crowns.
    - The bite comes from bite-registered scans, else from the CT.
 3. **Analyze**: measures crowding/spacing (with the setup's own contact walk), rotations,
    leveling, arch widths, midlines, incisor inclinations, overjet, overbite, molar class and

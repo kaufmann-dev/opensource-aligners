@@ -9,7 +9,7 @@ import trimesh
 from scipy.spatial import KDTree
 
 from aligners.analyze import arch_to_bite, final_arch_to_bite, posed_tooth
-from aligners.anatomy import JawAnatomy, Tooth, submesh
+from aligners.anatomy import JawAnatomy, submesh
 from aligners.case import Case, read_json, read_mesh, to_jsonable
 from aligners.fdi import JAWS
 from aligners.geometry import decimate
@@ -18,7 +18,6 @@ from aligners.motion import decompose
 TOOTH_FACES = 5000
 ROOT_FACES = 2500
 FILL_FACES = 3000
-FILL_CLEAR_MM = 0.6  # the CT crown is shown only this far from any scanned crown surface
 GUM_FACES = 60000
 GUM_FOLLOW_MM = 3.0
 
@@ -38,16 +37,6 @@ def _pack(mesh: trimesh.Trimesh) -> dict[str, str]:
         "v": base64.b64encode(np.asarray(mesh.vertices, np.float32).tobytes()).decode(),
         "f": base64.b64encode(np.asarray(mesh.faces, np.uint32).tobytes()).decode(),
     }
-
-
-def _crown_fill(ct_tooth: trimesh.Trimesh, t: Tooth, patch: trimesh.Trimesh) -> trimesh.Trimesh:
-    """The part of the CT tooth's crown the scan did not capture, e.g. where a crowded neighbor
-    hid it: derotation exposes it, and without it the open scan shell shows a hole."""
-    V = np.asarray(ct_tooth.vertices)
-    F = np.asarray(ct_tooth.faces)
-    crown = ((V - t.margin_center) @ t.o > -0.5)[F].all(axis=1)
-    far, _ = KDTree(np.asarray(patch.vertices)).query(V[F].mean(axis=1))
-    return decimate(submesh(ct_tooth, crown & (far > FILL_CLEAR_MM)), FILL_FACES, max_error=0.1)
 
 
 def build_preview(case: Case) -> str:
@@ -93,9 +82,9 @@ def build_preview(case: Case) -> str:
             }
             if n in anatomy.roots:
                 entry["root"] = _pack(decimate(anatomy.roots[n], ROOT_FACES, max_error=0.1))
-                fill = _crown_fill(anatomy.roots[n], t, anatomy.patches[n])
-                if len(fill.faces):
-                    entry["fill"] = _pack(fill)
+            # the completed crown, drawn just behind the scanned one: it shows only where the
+            # scan saw nothing, e.g. enamel a crowded neighbor hid that derotation exposes
+            entry["fill"] = _pack(decimate(anatomy.contact_solids[n], FILL_FACES, max_error=0.05))
             teeth[str(n)] = entry
         # everything in the scanned lower arch frame; surgical modes also show the jaws after
         group = np.eye(4) if not to_bite else np.linalg.inv(to_bite["lower"]) @ to_bite[jaw]
@@ -220,7 +209,9 @@ const gumMat = new THREE.MeshStandardMaterial({ color: 0xe8a0a0, roughness: 0.7,
 const rootMat = new THREE.MeshStandardMaterial({ color: 0xd8c8a0, transparent: true, opacity: 0.5 });
 const ghostMat = new THREE.MeshStandardMaterial({ color: 0x8899aa, transparent: true, opacity: 0.25, depthWrite: false });
 const hotMat = new THREE.MeshStandardMaterial({ color: 0xffc36b, roughness: 0.45, side: THREE.DoubleSide });
-const fillMat = new THREE.MeshStandardMaterial({ color: 0xe9e4d8, roughness: 0.6 });
+const behind = { polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 4 };
+const fillMat = new THREE.MeshStandardMaterial({ color: 0xf2eee4, roughness: 0.45, side: THREE.DoubleSide, ...behind });
+const hotFillMat = new THREE.MeshStandardMaterial({ color: 0xffc36b, roughness: 0.45, side: THREE.DoubleSide, ...behind });
 const groups = {}, teeth = [], gums = [], roots = [], ghosts = [], skins = [];
 let maxStage = 0;
 for (const [jaw, J] of Object.entries(DATA.jaws)) {
@@ -233,7 +224,7 @@ for (const [jaw, J] of Object.entries(DATA.jaws)) {
     const geo = decode(T.crown);
     const tooth = new THREE.Group(); tooth.matrixAutoUpdate = false;
     const mesh = new THREE.Mesh(geo, toothMat); mesh.userData = { n, T }; tooth.add(mesh);
-    if (T.fill) tooth.add(new THREE.Mesh(decode(T.fill), fillMat));
+    mesh.userData.fill = new THREE.Mesh(decode(T.fill), fillMat); tooth.add(mesh.userData.fill);
     if (T.root) { const r = new THREE.Mesh(decode(T.root), rootMat); r.visible = false; tooth.add(r); roots.push(r); }
     group.add(tooth); teeth.push({ tooth, mesh, T, jaw });
     const ghost = new THREE.Mesh(geo, ghostMat); ghost.visible = false; group.add(ghost); ghosts.push(ghost);
@@ -318,9 +309,10 @@ renderer.domElement.addEventListener('pointermove', (e) => {
   mouse.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
   ray.setFromCamera(mouse, camera);
   const hit = ray.intersectObjects(teeth.map(t => t.mesh))[0];
-  if (hot) hot.material = toothMat;
+  const paint = (on) => { hot.material = on ? hotMat : toothMat; hot.userData.fill.material = on ? hotFillMat : fillMat; };
+  if (hot) paint(false);
   if (!hit) { tip.style.display = 'none'; hot = null; return; }
-  hot = hit.object; hot.material = hotMat;
+  hot = hit.object; paint(true);
   const t = teeth.find(x => x.mesh === hot), m = t.T.movement[t.stage];
   tip.innerHTML = `<b>${hot.userData.n}</b> stage ${t.stage}<table>` + Object.entries(m).map(([k, v]) => `<tr><td>${k.replace('_', ' ')}</td><td>${v}</td></tr>`).join('') + '</table>';
   tip.style.display = 'block'; tip.style.left = (e.clientX - r.left + 14) + 'px'; tip.style.top = (e.clientY - r.top + 14) + 'px';

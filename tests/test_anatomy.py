@@ -131,3 +131,38 @@ def test_arch_form_is_smooth_through_the_incisors_and_ignores_a_displaced_tooth(
     assert np.linalg.norm(curve.point(s3) - pts[3]) < 0.8  # the displaced tooth comes back
     moved = form.curve(1.0)
     assert abs(moved.point(0.0)[1] - curve.point(0.0)[1] - 1.0) < 0.05
+
+
+def test_cusp_ridge_axis_follows_the_crest_not_the_outline():
+    from aligners.anatomy import cusp_ridge_axis
+
+    # canine-like crown on a round outline: the cusp ridges run 20 deg from x, the start
+    # direction (as from crowded contacts) is plain x
+    ridge = np.radians(20.0)
+    along = np.array([np.cos(ridge), np.sin(ridge)])
+    across = np.array([-np.sin(ridge), np.cos(ridge)])
+    u, v = np.meshgrid(np.linspace(-4, 4, 81), np.linspace(-4, 4, 81))
+    xy = np.column_stack([u.ravel(), v.ravel()])
+    xy = xy[np.linalg.norm(xy, axis=1) <= 4.0]
+    z = 6.0 - 1.5 * np.abs(xy @ across) - 0.3 * np.abs(xy @ along)
+    axis = cusp_ridge_axis(
+        np.column_stack([xy, z]), np.array([0.0, 0.0, 1.0]), np.array([1, 0, 0.0])
+    )
+    assert abs(np.dot(axis[:2], along)) > 0.995
+
+
+def test_fit_ct_tooth_meets_the_scan_and_fills_what_it_missed():
+    from aligners.anatomy import fit_ct_tooth
+
+    # the CT tooth segments 0.4 mm small; the scan (radius 4) misses a window on one side
+    ct = trimesh.creation.icosphere(subdivisions=4, radius=3.6)
+    sphere = trimesh.creation.icosphere(subdivisions=4, radius=4.0)
+    c = sphere.triangles_center
+    window = (c[:, 0] > 2.5) & (np.abs(c[:, 2]) < 1.5)
+    patch = submesh(sphere, (c[:, 2] > -2.0) & ~window)
+    r = np.linalg.norm(np.asarray(fit_ct_tooth(ct, patch).vertices), axis=1)
+    V = np.asarray(ct.vertices)
+    seen = V[:, 2] > 0.5 * 3.6
+    hidden = (V[:, 0] > 0.8 * 3.6) & (np.abs(V[:, 2]) < 0.5)
+    assert np.allclose(r[seen], 4.0, atol=0.05)
+    assert np.allclose(r[hidden], 4.0, atol=0.15)

@@ -330,12 +330,12 @@ class JawSolver:
         for (side, k), v in given.items():
             ipr[k] = ipr.get(k, 0.0) + v
             per_side[side] += v
-        rounded = {
-            k: float(np.ceil(v / IPR_STEP_MM - 1e-6) * IPR_STEP_MM)
-            for k, v in ipr.items()
-            if v > 1e-6
-        }
-        return rounded, per_side
+        steps = {k: int(np.ceil(v / IPR_STEP_MM - 1e-6)) for k, v in ipr.items() if v > 1e-6}
+        # rounding up must not break the arch total: take back the steps rounded up most
+        while steps and sum(steps.values()) * IPR_STEP_MM > total_cap + 1e-6:
+            k = max(steps, key=lambda k: steps[k] * IPR_STEP_MM - ipr[k])
+            steps[k] -= 1
+        return {k: n * IPR_STEP_MM for k, n in steps.items() if n > 0}, per_side
 
     # -- placement ----------------------------------------------------------------------------
     def solve(self, adjust: Adjust | None = None) -> JawSetup:

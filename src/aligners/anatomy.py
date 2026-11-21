@@ -1,10 +1,12 @@
 """Tooth solids, anatomical frames, landmarks and the gingiva heightfield (arch frame)."""
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
 from typing import Any, cast
 
+import igl
 import numpy as np
 import trimesh
 from numpy.typing import NDArray
@@ -17,7 +19,16 @@ from scipy.spatial import KDTree
 from aligners import fdi
 from aligners.case import CaseError, read_json, read_mesh, write_json, write_mesh
 from aligners.fdi import Jaw
-from aligners.geometry import Array, boundary_loops, pca, sample_surface
+from aligners.geometry import (
+    Array,
+    MeshSDF,
+    boundary_loops,
+    decimate,
+    grid_points,
+    level_set,
+    pca,
+    sample_surface,
+)
 from aligners.scan import patient_right_sign
 
 STUB_DEPTH_MM = 3.0
@@ -26,6 +37,13 @@ CR_ROOT_FRACTION = 0.4
 GUM_RES_MM = 0.1
 GUM_SOCKET_DROP_MM = 1.0
 CONTACT_HEIGHT_FRACTION = 0.4  # contacts are searched in the top 60 % of the crown
+RIDGE_BINS = 8  # mesiodistal bins of a canine's cusp-ridge crest
+RIDGE_PASSES = 4
+FIT_NEAR_MM = 1.5  # CT surface this close to the scanned crown, facing the same way, moves onto it
+FIT_RIM_MM = 0.4  # ... unless it meets the scan at the patch's open rim
+HIDDEN_CLEAR_MM = 0.3  # completed crown surface farther than this from the scan: missed enamel
+SOLID_RES_MM = 0.15  # grid of the completed crown solids
+SOLID_FACES = 20000
 ARCH_KNOTS_MM = np.array([0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 36.0, 44.0, 54.0])
 ARCH_LENGTH_MM = 80.0  # half-arch length built from the midline (beyond every tooth)
 ARCH_STEP_MM = 0.25
@@ -240,6 +258,92 @@ def close_crown(patch: trimesh.Trimesh, axis: Array, stub: bool = True) -> trime
     return solid
 
 
+def fit_ct_tooth(ct: trimesh.Trimesh, patch: trimesh.Trimesh) -> trimesh.Trimesh:
+    """The CT tooth moved along its normals onto the scanned crown where the scan saw it, the
+    offset spread harmonically over the rest: the scan's crown, completed with the CT's shape
+    where the scan saw nothing (enamel a crowded neighbor hid, the root)."""
+    V = np.asarray(ct.vertices, dtype=np.float64)
+    N = np.asarray(ct.vertex_normals, dtype=np.float64)
+    PV = np.ascontiguousarray(patch.vertices, dtype=np.float64)
+    PF = np.ascontiguousarray(patch.faces, dtype=np.int64)
+    d2, face, closest = (
+        np.asarray(a) for a in igl.point_mesh_squared_distance(np.ascontiguousarray(V), PV, PF)
+    )
+    facing = np.einsum("ij,ij->i", np.asarray(patch.face_normals)[face], N) > 0.5
+    known = (np.sqrt(d2) < FIT_NEAR_MM) & facing
+    loops = boundary_loops(PF)
+    if loops:
+        rim, _ = KDTree(PV[np.concatenate(loops)]).query(closest)
+        known &= rim > FIT_RIM_MM
+    offset = np.zeros(len(V))
+    offset[known] = np.einsum("ij,ij->i", closest[known] - V[known], N[known])
+    if known.any() and not known.all():
+        edges = np.asarray(ct.edges_unique)
+        ones = np.ones(2 * len(edges))
+        adj = sparse.coo_matrix(
+            (ones, (np.r_[edges[:, 0], edges[:, 1]], np.r_[edges[:, 1], edges[:, 0]])),
+            shape=(len(V), len(V)),
+        ).tocsr()
+        lap = sparse.csr_matrix(sparse.diags(np.asarray(adj.sum(axis=1)).ravel()) - adj)
+        free = ~known
+        # the tiny diagonal keeps parts without any scanned vertex solvable (offset 0)
+        system = sparse.csc_matrix(lap[free][:, free] + 1e-9 * sparse.identity(int(free.sum())))
+        offset[free] = np.asarray(spsolve(system, -(lap[free][:, known] @ offset[known])))
+    return trimesh.Trimesh(V + offset[:, None] * N, np.asarray(ct.faces), process=False)
+
+
+@dataclass
+class Neighbor:
+    """Distance fields of a neighboring crown as scanned and as its fitted CT tooth."""
+
+    scanned: MeshSDF
+    fitted: MeshSDF | None
+
+
+def _claim(own: Array, points: Array, neighbors: list[Neighbor]) -> Array:
+    """Negative where a point belongs to this tooth rather than a neighbor: outside the
+    neighbor's scanned crown and, where both fitted CT teeth reach, deeper in this one's (own:
+    this tooth's fitted distance at the points)."""
+    out = np.full(len(points), -1.0)
+    for nb in neighbors:
+        out = np.maximum(out, -nb.scanned(points, bound=1.0))
+        if nb.fitted is not None:
+            out = np.maximum(out, own - nb.fitted(points, bound=1.0))
+    return out
+
+
+def complete_crowns(
+    crown: trimesh.Trimesh,
+    solid: trimesh.Trimesh,
+    fit: trimesh.Trimesh,
+    floor: Callable[[Array], Array],
+    enamel: Callable[[Array], Array],
+    neighbors: list[Neighbor],
+) -> tuple[trimesh.Trimesh, trimesh.Trimesh]:
+    """The closed scanned crown (with stub) and solid (closed at the margin) each united with
+    the fitted CT tooth where it belongs to this tooth: the crown where floor(p) < 0, the solid
+    where enamel(p) < 0."""
+    V = np.asarray(fit.vertices)
+    kept = V[floor(V) < 0]
+    pad = 2 * SOLID_RES_MM
+    lo = np.minimum(crown.bounds[0], kept.min(axis=0) if len(kept) else crown.bounds[0]) - pad
+    hi = np.maximum(crown.bounds[1], kept.max(axis=0) if len(kept) else crown.bounds[1]) + pad
+    P, shape = grid_points(lo, hi, SOLID_RES_MM)
+    f = MeshSDF.of(fit)(P, bound=1.0)
+    part = np.maximum(f, _claim(f, P, neighbors))
+    out = []
+    for closed, region in ((crown, floor), (solid, enamel)):
+        d = np.minimum(MeshSDF.of(closed)(P, bound=1.0), np.maximum(part, region(P)))
+        mesh = level_set(d.reshape(shape), lo, SOLID_RES_MM)
+        out.append(decimate(mesh, SOLID_FACES, max_error=0.02))
+    return out[0], out[1]
+
+
+def below_plane(point: Array, axis: Array) -> Callable[[Array], Array]:
+    """Negative on the `axis` side of the plane through `point`."""
+    return lambda p: (point - p) @ axis
+
+
 def _weighted_centroid(mesh: trimesh.Trimesh) -> Array:
     area = np.asarray(mesh.area_faces)
     return (np.asarray(mesh.triangles_center) * area[:, None]).sum(0) / area.sum()
@@ -423,11 +527,12 @@ def build_tooth(
 ) -> tuple[Tooth, trimesh.Trimesh]:
     """Frame and landmarks of one tooth, all intrinsic to the tooth.
 
-    The mesiodistal axis m of incisors is their incisal edge; of canines, premolars and molars
-    it runs between the contacts with the neighbors (`contacts`), or along the arch at the arch
-    ends. (A canine's convex labial surface gives no reliable direction.) Contact points and width come from the
-    crown's own mesial and distal extremes along m, so overlapping (crowded) neighbors do not
-    distort them."""
+    The mesiodistal axis m of incisors is their incisal edge and of canines their cusp-ridge
+    crest, both intrinsic to the crown: where a crowded canine touches its neighbors says
+    little about how it is turned. Premolars and molars, whose cusps give no single crest, run
+    m between the contacts with the neighbors (`contacts`), or along the arch at the arch ends.
+    Contact points and width come from the crown's own mesial and distal extremes along m, so
+    overlapping (crowded) neighbors do not distort them."""
     V = np.asarray(patch.vertices)
     center = _weighted_centroid(patch)
     o = ct_axis / np.linalg.norm(ct_axis) if ct_axis is not None else np.array([0.0, 0.0, 1.0])
@@ -436,12 +541,17 @@ def build_tooth(
     along_arch = -x_sign * curve.tangent(s_here)
     solid = close_crown(patch, o)
     pos = fdi.position(number)
+    between = (
+        contacts["mesial"] - contacts["distal"]
+        if "mesial" in contacts and "distal" in contacts
+        else along_arch
+    )
     if pos <= 2:
         m = incisal_axis(V, o)
-    elif "mesial" in contacts and "distal" in contacts:
-        m = contacts["mesial"] - contacts["distal"]
+    elif pos == 3:
+        m = cusp_ridge_axis(V, o, between)
     else:
-        m = along_arch
+        m = between
     m = m - np.dot(m, o) * o
     if np.dot(m, along_arch) < 0:
         m = -m
@@ -515,6 +625,29 @@ def incisal_axis(vertices: Array, o: Array) -> Array:
     return pca(flat)[2][:, 0]
 
 
+def cusp_ridge_axis(vertices: Array, o: Array, m: Array) -> Array:
+    """Direction of a canine's mesial and distal cusp ridges seen along the tooth axis: the
+    line through the crest (highest crown points) of each mesiodistal slice, refined from the
+    start direction `m` (unsigned)."""
+    h = vertices @ o
+    for _ in range(RIDGE_PASSES):
+        m = m - np.dot(m, o) * o
+        m = m / np.linalg.norm(m)
+        s = vertices @ m
+        bins = np.linspace(float(np.percentile(s, 8)), float(np.percentile(s, 92)), RIDGE_BINS + 1)
+        crest = []
+        for a, b in zip(bins[:-1], bins[1:], strict=True):
+            sel = (s >= a) & (s < b)
+            if sel.sum() >= 5:
+                crest.append(vertices[sel][h[sel] >= np.quantile(h[sel], 0.9)].mean(axis=0))
+        if len(crest) < 3:
+            break
+        C = np.array(crest)
+        axis = pca(C - np.outer((C - C.mean(axis=0)) @ o, o))[2][:, 0]
+        m = axis if np.dot(axis, m) >= 0 else -axis
+    return m
+
+
 def incisal_edge(vertices: Array, m: Array, o: Array) -> Array:
     """Direction of the visible incisal edge: the crest (highest crown points along o) across
     the crown's mesiodistal extent, fitted as a line in the m-o plane; returned along +m."""
@@ -582,6 +715,12 @@ class GumField:
         ok = ndimage.map_coordinates(valid, ij, order=1, mode="constant", cval=0.0)
         g = ndimage.map_coordinates(grad, ij, order=1, mode="nearest")
         return np.where(ok > 0.999, z, np.nan), g
+
+    def above(self, pts: Array) -> Array:
+        """Negative above the gingiva surface (the socket under a crown counts at its rim's
+        level, not sunk); everywhere outside the gingiva."""
+        z, _ = self.sample(np.asarray(pts)[:, :2])
+        return np.where(np.isfinite(z), z + GUM_SOCKET_DROP_MM - np.asarray(pts)[:, 2], -1.0)
 
     def sdf(self, pts: Array) -> Array:
         """Approximate signed distance to the gingiva solid (negative below the surface)."""
@@ -679,6 +818,7 @@ def build_anatomy(
         n: (ct[n][0] / np.linalg.norm(ct[n][0]) if ct and n in ct else np.array([0.0, 0.0, 1.0]))
         for n in numbers
     }
+    gum = gum_heightfield(mesh, labels)
     contacts: dict[int, dict[str, Array]] = {n: {} for n in numbers}
     chain = []
     for a, b in zip(order[:-1], order[1:], strict=True):
@@ -697,18 +837,37 @@ def build_anatomy(
         old.unlink()
     teeth = []
     warnings = []
+    # the scan misses enamel where neighbors hid it: complete it from the CT tooth fitted to
+    # the scan, above the gingiva for contacts, down to the stub depth for fabrication; where
+    # the scan saw a neighbor, or the neighbor's CT tooth reaches deeper, this tooth is not
+    fits = {n: fit_ct_tooth(ct[n][1], patches[n]) for n in numbers if ct and n in ct}
+    scanned = {n: MeshSDF.of(close_crown(p, axes[n], stub=False)) for n, p in patches.items()}
+    fitted = {n: MeshSDF.of(f) for n, f in fits.items()}
     for n in numbers:
         ct_axis, ct_mesh = ct[n] if ct and n in ct else (None, None)
-        tooth, solid = build_tooth(n, jaw, patches[n], curve, ct_axis, ct_mesh, contacts[n])
+        tooth, crown = build_tooth(n, jaw, patches[n], curve, ct_axis, ct_mesh, contacts[n])
         expected = fdi.CROWN_WIDTH_MM[jaw][fdi.position(n)]
         if not 0.6 * expected <= tooth.width <= 1.4 * expected:
             warnings.append(f"tooth {n}: width {tooth.width:.1f} mm, expected ~{expected:.1f} mm")
-        write_mesh(out_dir / f"{n}_crown.ply", solid)
-        write_mesh(out_dir / f"{n}_patch.ply", patches[n])
+        solid = close_crown(patches[n], tooth.o, stub=False)
+        if n in fits:
+            V = np.asarray(patches[n].vertices)
+            loops = boundary_loops(np.asarray(patches[n].faces, dtype=np.int64))
+            margin = V[loops[0]] if loops else V
+            floor = margin[np.argmin(margin @ tooth.o)] - STUB_DEPTH_MM * tooth.o
+            i = order.index(n)
+            neighbors = [
+                Neighbor(scanned[m], fitted.get(m)) for m in order[max(i - 1, 0) : i + 2] if m != n
+            ]
+            crown, solid = complete_crowns(
+                crown, solid, fits[n], below_plane(floor, tooth.o), gum.above, neighbors
+            )
         if ct_mesh is not None:
             write_mesh(out_dir / f"{n}_root.ply", ct_mesh)
+        write_mesh(out_dir / f"{n}_crown.ply", crown)
+        write_mesh(out_dir / f"{n}_solid.ply", solid)
+        write_mesh(out_dir / f"{n}_patch.ply", patches[n])
         teeth.append(tooth.as_dict())
-    gum = gum_heightfield(mesh, labels)
     gum.save(out_dir / "gum.npz")
     info = {"jaw": jaw, "curve": curve.as_dict(), "teeth": teeth, "warnings": warnings}
     write_json(out_dir / "teeth.json", info)
@@ -724,35 +883,55 @@ class JawAnatomy:
     roots: dict[int, trimesh.Trimesh]
     gum: GumField
     patches: dict[int, trimesh.Trimesh]  # scanned crown surface only
+    contact_solids: dict[int, trimesh.Trimesh]  # crowns closed at the margin, no stub
 
     @classmethod
     def load(cls, directory: Path, jaw: Jaw) -> "JawAnatomy":
         info = read_json(directory / "teeth.json")
         teeth = {t["fdi"]: Tooth.from_dict(t) for t in info["teeth"]}
-        crowns = {n: read_mesh(directory / f"{n}_crown.ply") for n in teeth}
-        roots = {
-            n: read_mesh(directory / f"{n}_root.ply")
-            for n in teeth
-            if (directory / f"{n}_root.ply").exists()
-        }
+
+        def meshes(kind: str) -> dict[int, trimesh.Trimesh]:
+            paths = {n: directory / f"{n}_{kind}.ply" for n in teeth}
+            return {n: read_mesh(p) for n, p in paths.items() if p.exists()}
+
         return cls(
             jaw,
             ArchCurve.from_dict(info["curve"]),
             teeth,
-            crowns,
-            roots,
+            meshes("crown"),
+            meshes("root"),
             GumField.load(directory / "gum.npz"),
-            {n: read_mesh(directory / f"{n}_patch.ply") for n in teeth},
+            meshes("patch"),
+            meshes("solid"),
         )
 
     def order(self) -> list[int]:
         return fdi.arch_order(list(self.teeth))
 
     def enamel_samples(self, number: int, count: int = 1200, seed: int = 0) -> Array:
-        """Samples of the scanned crown surface (contacts and collisions are judged on these)."""
-        return sample_surface(self.patches[number], count, seed=seed)[0]
+        """Samples of the crown surface, scanned and hidden (contacts and collisions are judged
+        on these)."""
+        surface = self.patches[number]
+        if number in self.hidden:
+            surface = cast(
+                trimesh.Trimesh, trimesh.util.concatenate([surface, self.hidden[number]])
+            )
+        return sample_surface(surface, count, seed=seed)[0]
 
     @cached_property
-    def contact_solids(self) -> dict[int, trimesh.Trimesh]:
-        """Crowns closed flat at their own margin: the real enamel volume, no stub."""
-        return {n: close_crown(p, self.teeth[n].o, stub=False) for n, p in self.patches.items()}
+    def hidden(self) -> dict[int, trimesh.Trimesh]:
+        """Crown surface above the gingiva the scan missed: the completed crown away from the
+        scanned surface."""
+        out = {}
+        for n, solid in self.contact_solids.items():
+            patch = self.patches[n]
+            centers = np.ascontiguousarray(solid.triangles_center, dtype=np.float64)
+            d2, *_ = igl.point_mesh_squared_distance(
+                centers,
+                np.ascontiguousarray(patch.vertices, dtype=np.float64),
+                np.ascontiguousarray(patch.faces, dtype=np.int64),
+            )
+            keep = (np.sqrt(d2) > HIDDEN_CLEAR_MM) & (self.gum.above(centers) < -SOLID_RES_MM)
+            if keep.any():
+                out[n] = submesh(solid, keep)
+        return out

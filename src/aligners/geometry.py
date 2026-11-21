@@ -6,6 +6,7 @@ import trimesh
 from numpy.typing import NDArray
 from scipy.spatial import KDTree
 from scipy.spatial.transform import Rotation
+from skimage.measure import marching_cubes
 
 Array = NDArray[np.float64]
 
@@ -228,6 +229,27 @@ class MeshSDF:
             np.ascontiguousarray(points, dtype=np.float64), self.V, self.F
         )
         return np.sqrt(d2)
+
+
+def grid_points(lo: Array, hi: Array, res: float) -> tuple[Array, tuple[int, int, int]]:
+    """Points of a regular grid of spacing res from lo over [lo, hi], and the grid shape."""
+    axes = [lo[i] + res * np.arange(int(np.ceil((hi[i] - lo[i]) / res)) + 1) for i in range(3)]
+    grid = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1)
+    return grid.reshape(-1, 3), (len(axes[0]), len(axes[1]), len(axes[2]))
+
+
+def level_set(values: Array, lo: Array, res: float) -> trimesh.Trimesh:
+    """Closed surface of the largest region values < 0 on the grid `grid_points` made."""
+    # values exactly on the iso-level make zero-area triangles; the pad closes the box
+    values = np.pad(np.where(np.abs(values) < 1e-6, 1e-6, values), 1, constant_values=res)
+    verts, faces, _, _ = marching_cubes(-values, 0.0, spacing=(res, res, res))
+    mesh = trimesh.Trimesh(verts + np.asarray(lo) - res, faces, process=True)
+    parts = mesh.split(only_watertight=False)
+    if len(parts) > 1:
+        mesh = max(parts, key=lambda m: len(m.faces))
+    if mesh.volume < 0:
+        mesh.invert()
+    return mesh
 
 
 def face_adjacency_graph(mesh: trimesh.Trimesh) -> tuple[NDArray[np.int64], Array]:

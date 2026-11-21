@@ -193,6 +193,7 @@ def _anatomy(jaw: str, teeth: dict) -> JawAnatomy:
         {},
         gum,
         {n: p for n, (_, p) in teeth.items()},
+        {n: close_crown(p, t.o, stub=False) for n, (t, p) in teeth.items()},
     )
 
 
