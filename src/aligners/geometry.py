@@ -145,14 +145,10 @@ class ICPTarget:
         return T, rmse
 
 
-def mirror_plane(
-    points: Array, normals: Array, axis: Array, contain_axis: bool = True
-) -> tuple[Array, Array, float]:
-    """Best mirror-symmetry plane (unit normal, point, trimmed RMSE) of a point cloud.
-
-    The normal is searched perpendicular to `axis` in 5 degree steps and the mirrored copy is
-    refined by ICP. With `contain_axis` the plane is then forced to contain `axis`; otherwise
-    the ICP refinement may tilt it (e.g. a head rolled on the CT table)."""
+def mirror_plane(points: Array, normals: Array, axis: Array) -> tuple[Array, Array, float]:
+    """Best mirror-symmetry plane containing `axis` (unit normal, point, trimmed RMSE) of a
+    point cloud. The normal is searched perpendicular to `axis` in 5 degree steps and the
+    mirrored copy is refined by ICP."""
     target = ICPTarget(points, normals)
     c = points.mean(axis=0)
     u, v, _ = orthonormal_frame(axis, np.cross(axis, [1.0, 0.0, 0.0]) + 1e-9)
@@ -169,8 +165,7 @@ def mirror_plane(
     M = best[1]
     w, vecs = np.linalg.eig(M[:3, :3])
     normal = np.real(vecs[:, np.argmin(np.abs(w + 1))])
-    if contain_axis:
-        normal -= np.dot(normal, axis) * axis
+    normal -= np.dot(normal, axis) * axis
     normal /= np.linalg.norm(normal)
     point = (c + transform_points(M, c[None])[0]) / 2
     return normal, point, best[0]

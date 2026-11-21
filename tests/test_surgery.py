@@ -5,20 +5,19 @@ from scipy.spatial.transform import Rotation
 
 from aligners.anatomy import ArchCurve, GumField, JawAnatomy, Tooth, close_crown, submesh
 from aligners.case import CaseError
-from aligners.geometry import mirror_plane, rigid_fit, rotation_about, transform_points
+from aligners.geometry import rigid_fit, transform_points
 from aligners.surgery import (
-    HeadFrames,
+    DentalFrames,
     Occlusion,
-    distribute,
-    jaw_angles,
-    lefort_matrix,
+    movement_angles,
+    movements_for_relation,
     table_to_transform,
     table_vector,
-    to_head,
+    to_frame,
     transform_to_table,
 )
 
-PRE = {  # scanned upper landmarks, head frame (x right, y anterior, z up)
+PRE = {  # scanned upper landmarks, movement frame (x right, y anterior, z up)
     "incisor_midline": np.array([0.0, 0.0, 0.0]),
     "canine_right": np.array([16.0, -8.0, 1.0]),
     "canine_left": np.array([-16.0, -8.0, 1.0]),
@@ -38,19 +37,27 @@ def test_rigid_fit_recovers_a_transform_and_a_translation():
     assert np.allclose(one[:3, :3], np.eye(3)) and np.allclose(one[:3, 3], [3.0, 0, 0])
 
 
-def test_table_signs_follow_the_head_frame():
+def _movement(t: list[float], pitch: float, roll: float, yaw: float) -> np.ndarray:
+    """Rz(yaw) Ry(roll) Rx(pitch) about the incisor midline (the frame origin), then t."""
+    M = np.eye(4)
+    M[:3, :3] = Rotation.from_euler("ZYX", [yaw, roll, pitch], degrees=True).as_matrix()
+    M[:3, 3] = t
+    return M
+
+
+def test_table_signs_follow_the_movement_frame():
     assert np.allclose(table_vector({"forward_mm": 1, "up_mm": 0, "left_mm": 0}), [0, 1, 0])
     assert np.allclose(table_vector({"forward_mm": 0, "up_mm": 1, "left_mm": 0}), [0, 0, 1])
     assert np.allclose(table_vector({"forward_mm": 0, "up_mm": 0, "left_mm": 1}), [-1, 0, 0])
 
 
 def test_movement_table_round_trip():
-    M = lefort_matrix(PRE["incisor_midline"], np.array([1.0, 4.0, -2.0]), 0.03, -0.02, 0.04)
+    M = _movement([1.0, 4.0, -2.0], 1.7, -1.1, 2.3)
     table = transform_to_table(M, PRE)
     back, residuals = table_to_transform(table, PRE, "maxilla")
     assert max(residuals.values()) < 0.1
-    moved = np.array(list(to_head(back, PRE).values()))
-    assert np.abs(moved - np.array(list(to_head(M, PRE).values()))).max() < 0.1
+    moved = np.array(list(to_frame(back, PRE).values()))
+    assert np.abs(moved - np.array(list(to_frame(M, PRE).values()))).max() < 0.1
     shift = {"incisor_midline": {"forward_mm": 4.0, "up_mm": 0.0, "left_mm": 0.0}}
     T, _ = table_to_transform(shift, PRE, "maxilla")
     assert np.allclose(T[:3, 3], [0.0, 4.0, 0.0]) and np.allclose(T[:3, :3], np.eye(3))
@@ -68,85 +75,63 @@ def test_movement_table_errors():
         table_to_transform({"incisor_midline": move}, {}, "maxilla")
 
 
-def test_angle_signs():
-    lm = {k: v.copy() for k, v in PRE.items()}
-    assert abs(jaw_angles(lm)["cant_deg"]) < 1e-9
-    lm["molar_left"][2] += 2.0
-    assert jaw_angles(lm)["cant_deg"] > 0  # + = patient-left side up
-    lm = {k: v.copy() for k, v in PRE.items()}
-    lm["incisor_midline"] += [-1.0, 0.0, 3.0]  # incisors toward patient left and up
-    a = jaw_angles(lm)
-    assert a["yaw_deg"] > 0 and a["midline_mm"] > 0 and a["occlusal_pitch_deg"] > 0
-
-
-def test_lefort_matrix_rotation_signs():
-    p = np.zeros(3)
+def test_movement_angle_signs():
     front, right = np.array([[0.0, 10.0, 0.0]]), np.array([[10.0, 0.0, 0.0]])
-    assert transform_points(lefort_matrix(p, p, 0.1, 0.0, 0.0), front)[0, 2] > 0  # pitch: up
-    assert transform_points(lefort_matrix(p, p, 0.0, 0.1, 0.0), right)[0, 2] < 0  # roll: R down
-    assert transform_points(lefort_matrix(p, p, 0.0, 0.0, 0.1), front)[0, 0] < 0  # yaw: left
+    up = _movement([0, 0, 0], 3.0, 0.0, 0.0)
+    assert transform_points(up, front)[0, 2] > 0 and movement_angles(up)["pitch_deg"] > 2.9
+    roll = _movement([0, 0, 0], 0.0, 3.0, 0.0)  # + = patient-left side up = right side down
+    assert transform_points(roll, right)[0, 2] < 0 and movement_angles(roll)["roll_deg"] > 2.9
+    yaw = _movement([0, 0, 0], 0.0, 0.0, 3.0)  # + = front toward the patient's left (-x)
+    assert transform_points(yaw, front)[0, 0] < 0 and movement_angles(yaw)["yaw_deg"] > 2.9
 
 
-def test_mirror_plane_finds_a_tilted_symmetry_plane():
-    rng = np.random.default_rng(3)
-    half = rng.uniform([5, -40, -20], [60, 40, 30], size=(2000, 3))
-    half[:, 2] += 0.02 * half[:, 1] ** 2  # no other symmetry
-    pts = np.vstack([half, half * [-1, 1, 1]])
-    R = rotation_about(np.array([0.0, 0.0, 1.0]), np.radians(4.0)) @ rotation_about(
-        np.array([0.0, 1.0, 0.0]), np.radians(3.0)
-    )
-    pts = transform_points(R, pts)
-    normals = np.tile(R[:3, 0], (len(pts), 1))
-    normal, _, rmse = mirror_plane(pts, normals, np.array([0.0, 0.0, 1.0]), contain_axis=False)
-    assert abs(abs(normal @ R[:3, 0]) - 1.0) < 1e-3 and rmse < 0.5
-
-
-def _frames() -> HeadFrames:
+def _frames() -> DentalFrames:
     P_u = np.eye(4)
     P_u[:3, :3] = Rotation.from_euler("y", 180, degrees=True).as_matrix()
-    P_u[:3, 3] = [0.5, 0.0, 0.0]
     P_l = np.eye(4)
     P_l[:3, 3] = [0.0, -3.0, -12.0]
-    return HeadFrames(np.eye(4), {"upper": P_u, "lower": P_l}, {}, {}, 0.0)
+    to_bite = {"upper": np.linalg.inv(P_u), "lower": np.linalg.inv(P_u) @ P_l}
+    return DentalFrames({"upper": P_u, "lower": P_l}, {}, to_bite, 0.0)
 
 
-def test_distribute_realizes_the_occlusion_and_levels_the_maxilla():
-    hf = _frames()
+def test_movements_realize_the_relation_moving_one_jaw():
+    from aligners.surgery import arch_to_bite_after
+
+    frames = _frames()
     X = np.eye(4)
     X[:3, :3] = Rotation.from_euler("yz", [180, 4], degrees=True).as_matrix()
     X[:3, 3] = [1.0, -2.0, 11.0]
-    upper_lm = to_head(np.linalg.inv(hf.P["upper"]), PRE)  # arch frame
-    upper_lm["molar_left"] = upper_lm["molar_left"] + [0.0, 0.0, 1.5]  # a cant in the arch
-    cfg = {
-        "osteotomies": ["lefort1", "bsso"],
-        "maxilla_forward_mm": 2.0,
-        "maxilla_up_mm": 1.0,
-        "maxilla_pitch_deg": 0.0,
-    }
-    M_max, M_mand, _ = distribute(X, hf, cfg, upper_lm, {})
-    Q_u, Q_l = M_max @ hf.P["upper"], M_mand @ hf.P["lower"]
-    assert np.allclose(np.linalg.inv(Q_l) @ Q_u, X, atol=1e-9)
-    a = jaw_angles(to_head(Q_u, upper_lm))
-    assert abs(a["cant_deg"]) < 0.01 and abs(a["yaw_deg"]) < 0.01 and abs(a["midline_mm"]) < 0.01
-    moved = transform_points(M_max, PRE["incisor_midline"][None])[0] - PRE["incisor_midline"]
-    assert abs(moved[1] - 2.0) < 1e-6 and abs(moved[2] - 1.0) < 1e-6
+    for move in ("mandible", "maxilla"):
+        M = movements_for_relation(X, frames, move)
+        fixed = "maxilla" if move == "mandible" else "mandible"
+        assert np.allclose(M[fixed], np.eye(4))
+        after = arch_to_bite_after(frames, M)
+        assert np.allclose(np.linalg.inv(after["lower"]) @ after["upper"], X, atol=1e-9)
 
-    M_max, M_mand, _ = distribute(X, hf, {**cfg, "osteotomies": ["bsso"]}, upper_lm, {})
-    assert np.allclose(M_max, np.eye(4))
-    Q_l = M_mand @ hf.P["lower"]
-    assert np.allclose(np.linalg.inv(Q_l) @ hf.P["upper"], X, atol=1e-9)
 
-    condyles = {
-        "condylion_right": np.array([50.0, -80.0, 20.0]),
-        "condylion_left": np.array([-50.0, -80.0, 20.0]),
+def test_dental_frame_pitch_tilts_the_horizontal_anterior_up(tmp_path):
+    import json
+
+    from aligners.surgery import dental_frames
+
+    (tmp_path / "work").mkdir()
+    identity = np.eye(4).tolist()
+    jaws = {
+        jaw: {"scan_to_arch": identity, "ct_to_scan": identity, "arch_to_bite": identity}
+        for jaw in ("upper", "lower")
     }
-    M_max, M_mand, _ = distribute(X, hf, {**cfg, "osteotomies": ["lefort1"]}, upper_lm, condyles)
-    for c in condyles.values():
-        assert np.allclose(transform_points(M_mand, c[None])[0], c, atol=1e-9)
-    Q_u, Q_l = M_max @ hf.P["upper"], M_mand @ hf.P["lower"]
-    assert np.allclose(np.linalg.inv(Q_l) @ Q_u, X, atol=1e-9)
-    moved = transform_points(M_max, PRE["incisor_midline"][None])[0] - PRE["incisor_midline"]
-    assert abs(moved[2] - 1.0) < 1e-4
+    (tmp_path / "work" / "frames.json").write_text(
+        json.dumps({"bite_source": "scans", "jaws": jaws})
+    )
+    from aligners.case import Case
+
+    frames = dental_frames(Case(tmp_path), {"surgery": {"pitch_deg": 10.0}})
+    anterior = frames.P["upper"][:3, :3] @ np.array([0.0, 1.0, 0.0])  # upper arch +y
+    occlusal = frames.P["upper"][:3, :3] @ np.array([0.0, 0.0, 1.0])  # toward the lower arch
+    assert anterior[1] > 0.98 and anterior[2] < -0.17  # the occlusal plane's front lies lower
+    assert occlusal[2] < -0.98  # z superior
+    left = frames.P["upper"][:3, :3] @ np.array([1.0, 0.0, 0.0])  # upper arch +x = patient left
+    assert left[0] < -0.99
 
 
 # -- ideal occlusion on box teeth -------------------------------------------------------------
@@ -268,22 +253,18 @@ def test_landmarks_contract_reproduces_the_movement_table():
         T[:3, 3] = rng.normal(size=3) * shift
         return T
 
-    H, B = rigid(0.3, 50.0), rigid(0.3, 50.0)  # CT->head; CT-image mandible -> head (occluded)
+    # CT -> frame of the upper teeth; CT-image lower teeth -> frame in the scanned occlusion
+    C = {"upper": rigid(0.3, 50.0), "lower": rigid(0.3, 50.0)}
     M = {"maxilla": rigid(0.05, 3.0), "mandible": rigid(0.05, 3.0)}
     scanned = {"upper": PRE, "lower": {k: v - [0.0, 2.0, 10.0] for k, v in PRE.items()}}
-    report = {
-        "ct_to_head": H,
-        "mandible_bone_to_head": B,
-        "head_pitch_deg": 0.0,
-        "landmarks_scanned_head": scanned,
-    }
+    report = {"ct_to_frame": C, "pitch_deg": 0.0, "landmarks_scanned_frame": scanned}
     doc = landmarks_document(report)
     frame = doc["head_frame"]
-    head_to_ct = np.linalg.inv(H)
-    # what the planner holds: CT-image -> post-op LPS transforms of its bone segments
+    frame_to_ct = np.linalg.inv(C["upper"])
+    # what the planner holds: CT-image -> post-op LPS transforms of its jaw segments
     planner = {
-        "maxilla": head_to_ct @ M["maxilla"] @ H,
-        "mandible": head_to_ct @ M["mandible"] @ B,
+        "maxilla": frame_to_ct @ M["maxilla"] @ C["upper"],
+        "mandible": frame_to_ct @ M["mandible"] @ C["lower"],
     }
     for jaw, bone in (("upper", "maxilla"), ("lower", "mandible")):
         expected = transform_to_table(M[bone], scanned[jaw])

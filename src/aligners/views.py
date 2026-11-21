@@ -1,5 +1,5 @@
 """Named render sets for humans and agents: segmentation, setup, stage:N, bite, bite:final,
-surgery."""
+surgery (teeth only)."""
 
 from pathlib import Path
 from typing import Any
@@ -9,7 +9,7 @@ import trimesh
 
 from aligners.analyze import arch_to_bite, final_arch_to_bite, posed_patch
 from aligners.anatomy import JawAnatomy
-from aligners.case import Case, CaseError, read_json, read_mesh
+from aligners.case import Case, CaseError, read_json
 from aligners.fdi import Jaw
 from aligners.geometry import Array, transform_points
 from aligners.render import Item, render, tooth_color
@@ -112,48 +112,34 @@ def render_what(case: Case, what: str) -> dict[str, Any]:
     return {"files": [str(f) for f in files]}
 
 
-BONE_COLOR = (0.93, 0.89, 0.8)
 GHOST = (0.6, 0.6, 0.6)
 
 
 def render_surgery(case: Case) -> Path:
-    """Head frame, frontal and profile views: the planned bone segments and the final teeth
-    after surgery in color, the bone before surgery as a grey ghost, the cranium faint."""
-    from aligners.surgery import segment_poses
-
+    """The planned (final) teeth in color in their occlusion after surgery, and the moved jaw's
+    teeth before surgery as a grey ghost; scanned lower arch frame, front and side views."""
     setup = read_json(case.require(case.work / "setup.json", "setup"))
-    report = setup.get("surgery")
-    if not report:
+    if not setup.get("surgery"):
         raise CaseError("no surgery planned: set [surgery] mode in plan.toml and run `setup`")
-    poses = segment_poses(report)
+    before = arch_to_bite(case)
+    assert before is not None
+    after = final_arch_to_bite(case)
+    view = np.linalg.inv(before["lower"])
     items: list[Item] = []
-    for name, (before, after) in poses.items():
-        path = case.work / "surgery" / f"{name}.ply"
-        if not path.exists():
-            continue
-        mesh = read_mesh(path)
-        V = np.asarray(mesh.vertices)
-        if name == "cranium":
-            items.append(
-                Item(trimesh.Trimesh(transform_points(after, V), mesh.faces), GHOST, opacity=0.3)
-            )
-            continue
-        moved = not np.allclose(before, after)
-        if moved:
-            items.append(
-                Item(trimesh.Trimesh(transform_points(before, V), mesh.faces), GHOST, opacity=0.25)
-            )
-        items.append(Item(trimesh.Trimesh(transform_points(after, V), mesh.faces), BONE_COLOR))
-    Q = report["arch_to_head"]["after_surgery"]
     for jaw in case.jaws():
         anatomy = JawAnatomy.load(case.anatomy_dir(jaw), jaw)
         final = _poses(case, "setup", jaw)
-        items += _crowns(anatomy, final, np.asarray(Q[jaw], float))
+        if not np.allclose(before[jaw], after[jaw]):
+            items += [
+                Item(i.mesh, color=GHOST, opacity=0.3)
+                for i in _crowns(anatomy, final, view @ before[jaw])
+            ]
+        items += _crowns(anatomy, final, view @ after[jaw])
     return render(
         case.renders / "surgery.png",
         items,
         (),
         np.array([1.0, 0.0, 0.0]),
-        "after surgery (grey = before)",
-        views=("frontal", "right", "left", "inferior"),
+        "after surgery (grey = moved jaw before surgery)",
+        views=("frontal", "right", "left", "occlusal"),
     )

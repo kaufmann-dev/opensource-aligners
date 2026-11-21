@@ -8,8 +8,8 @@ import numpy as np
 import trimesh
 from scipy.spatial import KDTree
 
-from aligners.analyze import arch_to_bite, posed_tooth
-from aligners.anatomy import JawAnatomy, submesh
+from aligners.analyze import arch_to_bite, final_arch_to_bite, posed_tooth
+from aligners.anatomy import JawAnatomy, Tooth, submesh
 from aligners.case import Case, read_json, read_mesh, to_jsonable
 from aligners.fdi import JAWS
 from aligners.geometry import decimate
@@ -17,35 +17,19 @@ from aligners.motion import decompose
 
 TOOTH_FACES = 5000
 ROOT_FACES = 2500
+FILL_FACES = 3000
+FILL_CLEAR_MM = 0.6  # the CT crown is shown only this far from any scanned crown surface
 GUM_FACES = 60000
-BONE_FACES = {"cranium": 40000}
-DEFAULT_BONE_FACES = 25000
 GUM_FOLLOW_MM = 3.0
 
 
-def _surgery_data(case: Case, report: dict[str, Any]) -> dict[str, Any]:
-    """Bone segments (CT coordinates) with their head-frame placement before/after surgery,
-    and the tables shown in the sidebar."""
-    from aligners.surgery import segment_poses
-
-    bones = {}
-    for name, (pre, post) in segment_poses(report).items():
-        path = case.work / "surgery" / f"{name}.ply"
-        if not path.exists():
-            continue
-        mesh = decimate(read_mesh(path), BONE_FACES.get(name, DEFAULT_BONE_FACES), max_error=0.2)
-        bones[name] = {
-            "mesh": _pack(mesh),
-            "pre": pre.T.ravel().round(6).tolist(),
-            "post": post.T.ravel().round(6).tolist(),
-        }
+def _surgery_data(report: dict[str, Any]) -> dict[str, Any]:
+    """The planned jaw movements shown in the sidebar."""
     return {
-        "bones": bones,
-        "movements": report["movements"],
-        "angles": report["angles"],
-        "splits": report["split_gap_mm"],
-        "chin": report["chin_mm"],
         "mode": report["mode"],
+        "moved": report["moved"],
+        "movements": report["movements"],
+        "rotations": report["rotations"],
     }
 
 
@@ -54,6 +38,16 @@ def _pack(mesh: trimesh.Trimesh) -> dict[str, str]:
         "v": base64.b64encode(np.asarray(mesh.vertices, np.float32).tobytes()).decode(),
         "f": base64.b64encode(np.asarray(mesh.faces, np.uint32).tobytes()).decode(),
     }
+
+
+def _crown_fill(ct_tooth: trimesh.Trimesh, t: Tooth, patch: trimesh.Trimesh) -> trimesh.Trimesh:
+    """The part of the CT tooth's crown the scan did not capture, e.g. where a crowded neighbor
+    hid it: derotation exposes it, and without it the open scan shell shows a hole."""
+    V = np.asarray(ct_tooth.vertices)
+    F = np.asarray(ct_tooth.faces)
+    crown = ((V - t.margin_center) @ t.o > -0.5)[F].all(axis=1)
+    far, _ = KDTree(np.asarray(patch.vertices)).query(V[F].mean(axis=1))
+    return decimate(submesh(ct_tooth, crown & (far > FILL_CLEAR_MM)), FILL_FACES, max_error=0.1)
 
 
 def build_preview(case: Case) -> str:
@@ -71,8 +65,9 @@ def build_preview(case: Case) -> str:
     to_bite = arch_to_bite(case)
     report = read_json(case.require(case.work / "setup.json", "setup")).get("surgery")
     data: dict[str, Any] = {"jaws": {}, "findings": checks["findings"]}
+    after = final_arch_to_bite(case) if report else None
     if report:
-        data["surgery"] = _surgery_data(case, report)
+        data["surgery"] = _surgery_data(report)
     for jaw in JAWS:
         anatomy = JawAnatomy.load(case.anatomy_dir(jaw), jaw)
         scan = read_mesh(case.scan_dir / f"{jaw}.ply")
@@ -98,14 +93,15 @@ def build_preview(case: Case) -> str:
             }
             if n in anatomy.roots:
                 entry["root"] = _pack(decimate(anatomy.roots[n], ROOT_FACES, max_error=0.1))
+                fill = _crown_fill(anatomy.roots[n], t, anatomy.patches[n])
+                if len(fill.faces):
+                    entry["fill"] = _pack(fill)
             teeth[str(n)] = entry
-        group = np.eye(4)
+        # everything in the scanned lower arch frame; surgical modes also show the jaws after
+        group = np.eye(4) if not to_bite else np.linalg.inv(to_bite["lower"]) @ to_bite[jaw]
         group_post = None
-        if report:  # surgical modes are shown in the head frame, before/after surgery
-            group = np.asarray(report["arch_to_head"]["before_surgery"][jaw], float)
-            group_post = np.asarray(report["arch_to_head"]["after_surgery"][jaw], float)
-        elif to_bite:
-            group = np.linalg.inv(to_bite["lower"]) @ to_bite[jaw]
+        if to_bite and after:
+            group_post = np.linalg.inv(to_bite["lower"]) @ after[jaw]
         # gingiva follows the teeth near it with weight (1 - d/3mm)^2, blending the two nearest
         # crowns by inverse squared distance: a papilla between two moving teeth stretches
         # instead of tearing, and the margin at a crown still follows that crown exactly
@@ -187,10 +183,7 @@ TEMPLATE = r"""<!doctype html>
     </div>
     <div id="surgeryBox" hidden>
       <h1>Surgery</h1>
-      <div class="row">
-        <label><input type="checkbox" id="post"> After surgery</label>
-        <label><input type="checkbox" id="bone" checked> Bone</label>
-      </div>
+      <div class="row"><label><input type="checkbox" id="post"> After surgery</label></div>
       <div id="surgery" class="muted"></div>
     </div>
     <h1>IPR (before stage 1)</h1><div id="ipr" class="muted"></div>
@@ -221,11 +214,13 @@ function decode(p) {
   g.setAttribute('position', new THREE.BufferAttribute(v, 3)); g.setIndex(new THREE.BufferAttribute(f, 1));
   g.computeVertexNormals(); return g;
 }
-const toothMat = new THREE.MeshStandardMaterial({ color: 0xf2eee4, roughness: 0.45 });
+// crowns are open scan shells: their inside shows where neighbors part, not the background
+const toothMat = new THREE.MeshStandardMaterial({ color: 0xf2eee4, roughness: 0.45, side: THREE.DoubleSide });
 const gumMat = new THREE.MeshStandardMaterial({ color: 0xe8a0a0, roughness: 0.7, side: THREE.DoubleSide });
 const rootMat = new THREE.MeshStandardMaterial({ color: 0xd8c8a0, transparent: true, opacity: 0.5 });
 const ghostMat = new THREE.MeshStandardMaterial({ color: 0x8899aa, transparent: true, opacity: 0.25, depthWrite: false });
-const hotMat = new THREE.MeshStandardMaterial({ color: 0xffc36b, roughness: 0.45 });
+const hotMat = new THREE.MeshStandardMaterial({ color: 0xffc36b, roughness: 0.45, side: THREE.DoubleSide });
+const fillMat = new THREE.MeshStandardMaterial({ color: 0xe9e4d8, roughness: 0.6 });
 const groups = {}, teeth = [], gums = [], roots = [], ghosts = [], skins = [];
 let maxStage = 0;
 for (const [jaw, J] of Object.entries(DATA.jaws)) {
@@ -238,23 +233,14 @@ for (const [jaw, J] of Object.entries(DATA.jaws)) {
     const geo = decode(T.crown);
     const tooth = new THREE.Group(); tooth.matrixAutoUpdate = false;
     const mesh = new THREE.Mesh(geo, toothMat); mesh.userData = { n, T }; tooth.add(mesh);
+    if (T.fill) tooth.add(new THREE.Mesh(decode(T.fill), fillMat));
     if (T.root) { const r = new THREE.Mesh(decode(T.root), rootMat); r.visible = false; tooth.add(r); roots.push(r); }
     group.add(tooth); teeth.push({ tooth, mesh, T, jaw });
     const ghost = new THREE.Mesh(geo, ghostMat); ghost.visible = false; group.add(ghost); ghosts.push(ghost);
   }
 }
-const bones = [];
-if (DATA.surgery) {
-  const boneMat = new THREE.MeshStandardMaterial({ color: 0xe9e0c9, roughness: 0.8 });
-  const craniumMat = new THREE.MeshStandardMaterial({ color: 0xd9d4c7, roughness: 0.9, transparent: true, opacity: 0.35, depthWrite: false });
-  for (const [name, B] of Object.entries(DATA.surgery.bones)) {
-    const mesh = new THREE.Mesh(decode(B.mesh), name === 'cranium' ? craniumMat : boneMat);
-    mesh.matrixAutoUpdate = false; mesh.matrix.fromArray(B.pre); scene.add(mesh); bones.push({ mesh, B });
-  }
-}
 function setSurgery(post) {
   for (const [jaw, J] of Object.entries(DATA.jaws)) groups[jaw].matrix.fromArray(post && J.groupPost ? J.groupPost : J.group);
-  for (const b of bones) b.mesh.matrix.fromArray(post ? b.B.post : b.B.pre);
 }
 const slider = document.getElementById('stage'); slider.max = maxStage;
 const VIEWS = {  // camera position, view-up; lower arch frame: +z toward the upper arch, +y anterior
@@ -264,15 +250,13 @@ const VIEWS = {  // camera position, view-up; lower arch frame: +z toward the up
   upper: [[0, -18, -110], [0, 1, 0], 'upper'],
   lower: [[0, -18, 110], [0, 1, 0], 'lower'],
 };
-const ZOOM = DATA.surgery ? 2.4 : 1;  // the head frame shows the skull around the teeth
 function setView(name) {
   const [pos, up, only] = VIEWS[name];
-  camera.position.set(...pos.map(v => v * ZOOM)); camera.up.set(...up); controls.target.set(0, -18 * ZOOM, 0); controls.update();
+  camera.position.set(...pos); camera.up.set(...up); controls.target.set(0, -18, 0); controls.update();
   for (const jaw of ['upper', 'lower']) {
     const show = !only || only === jaw;
     groups[jaw].visible = show; document.getElementById(jaw).checked = show;
   }
-  if (DATA.surgery) { const show = !only && document.getElementById('bone').checked; bones.forEach(b => b.mesh.visible = show); }
 }
 document.querySelectorAll('[data-view]').forEach(b => b.onclick = () => setView(b.dataset.view));
 document.getElementById('stageMax').textContent = maxStage;
@@ -299,7 +283,7 @@ function setStage(s) {
   }
 }
 slider.oninput = () => setStage(+slider.value); setStage(0);
-window.preview = { setStage: (s) => { slider.value = s; setStage(s); }, setView, setSurgery, maxStage, camera, controls, groups, gums, bones };
+window.preview = { setStage: (s) => { slider.value = s; setStage(s); }, setView, setSurgery, maxStage, camera, controls, groups, gums };
 let timer = null;
 document.getElementById('play').onclick = (e) => {
   if (timer) { clearInterval(timer); timer = null; e.target.textContent = 'Play'; return; }
@@ -315,17 +299,14 @@ if (DATA.surgery) {
   const S = DATA.surgery, f = v => (v > 0 ? '+' : '') + v.toFixed(1);
   document.getElementById('surgeryBox').hidden = false;
   document.getElementById('post').onchange = (e) => setSurgery(e.target.checked);
-  document.getElementById('bone').onchange = (e) => bones.forEach(b => b.mesh.visible = e.target.checked);
-  let html = `<div>mode: ${S.mode} (forward / up / left mm)</div>`;
+  let html = `<div>mode: ${S.mode}, moved: ${S.moved} (forward / up / left mm)</div>`;
   for (const bone of ['maxilla', 'mandible']) {
+    const r = S.rotations[bone];
+    if (!Object.values(S.movements[bone]).some(m => m.forward_mm || m.up_mm || m.left_mm) && !Object.values(r).some(v => Math.abs(v) > 0.05)) continue;
     html += `<b>${bone}</b><table>` + Object.entries(S.movements[bone]).map(([k, m]) => `<tr><td>${k.replace('_', ' ')}</td><td>${f(m.forward_mm)}</td><td>${f(m.up_mm)}</td><td>${f(m.left_mm)}</td></tr>`).join('') + '</table>';
-    const a = S.angles[bone], before = a.before_surgery, after = a.after_surgery;
-    html += '<table>' + ['cant_deg', 'yaw_deg', 'occlusal_pitch_deg', 'midline_mm'].filter(k => k in after).map(k => `<tr><td>${k.replace(/_/g, ' ')}</td><td>${f(before[k])} → ${f(after[k])}</td></tr>`).join('') + '</table>';
+    html += `<div>pitch ${f(r.pitch_deg)}°, roll ${f(r.roll_deg)}°, yaw ${f(r.yaw_deg)}°</div>`;
   }
-  html += 'split gap (+) / overlap (−) mm: ' + list(S.splits, ([k, v]) => `${k} ${f(v)}`) + '<br>';
-  html += 'chin off midline (+ left) mm: ' + list(S.chin, ([k, v]) => `${k} ${f(v)}`);
   document.getElementById('surgery').innerHTML = html;
-  setView('front');
 }
 document.getElementById('ipr').innerHTML = Object.entries(DATA.jaws).map(([j, J]) => `<b>${j}</b>: ` + list(J.ipr, ([k, v]) => `${k}: ${v.toFixed(2)} mm`)).join('<br>');
 document.getElementById('att').innerHTML = Object.entries(DATA.jaws).map(([j, J]) => `<b>${j}</b>: ` + list(J.attachments, ([k, v]) => `${k} ${v}`)).join('<br>');

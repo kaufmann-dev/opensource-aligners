@@ -32,6 +32,8 @@ CREASE_SMOOTH_PASSES = 8  # Laplacian passes of the concavity measure
 GUMLINE_SIGMA_MM = 0.03  # concavity at which cutting along a crease becomes almost free
 SNAP_TOOTH_MM = 1.2  # deeper crown faces stay tooth (a cut along a fissure could drop a cusp)
 SNAP_GUM_MM = 1.5  # faces farther out on the gingiva than this stay gingiva
+INTERPROXIMAL_BAND_MM = 2.0  # a tooth/tooth boundary may move this far onto either crown
+RELABEL_COST_PER_MM2 = 0.3  # cut length (mm) worth relabeling 1 mm^2 of crown
 
 Labels = NDArray[np.int64]
 
@@ -173,17 +175,19 @@ def cleanup(mesh: trimesh.Trimesh, labels: Labels) -> tuple[Labels, list[str]]:
         todo = np.flatnonzero(out < 0)
         if len(todo) == 0:
             break
+        # synchronous growth from every side at once: a label must not flood a whole thin
+        # region in one pass just because its faces come first in index order
         sub = adj[todo]
-        filled = False
+        new = out.copy()
         for row, face in zip(range(len(todo)), todo, strict=True):
             nbr = out[sub.indices[sub.indptr[row] : sub.indptr[row + 1]]]
             nbr = nbr[nbr >= 0]
             if len(nbr):
                 vals, counts = np.unique(nbr, return_counts=True)
-                out[face] = vals[np.argmax(counts)]
-                filled = True
-        if not filled:
+                new[face] = vals[np.argmax(counts)]
+        if np.array_equal(new, out):
             break
+        out = new
     out[out < 0] = 0
     return out, warnings
 
@@ -273,13 +277,9 @@ def concavity(mesh: trimesh.Trimesh) -> Array:
     return np.einsum("ij,ij->i", v - smooth, np.asarray(mesh.vertex_normals))
 
 
-def snap_gumline(mesh: trimesh.Trimesh, labels: Labels) -> Labels:
-    """Move the tooth/gingiva boundary onto the gingival crease.
-
-    The CT-derived labels put the boundary about 0.5 mm onto the gingiva (the CT blurs the
-    tooth neck). A binary min-cut over the faces near the boundary, with edge costs that
-    almost vanish along concave creases, snaps it onto the real gumline. Faces deep inside
-    a crown stay tooth and faces far out on the gingiva stay gingiva."""
+def _crease_cost(mesh: trimesh.Trimesh) -> tuple[NDArray[np.int64], Array, Array]:
+    """Face adjacency pairs, the cost of cutting each shared edge (almost free along concave
+    creases) and the distance between the two face centers."""
     pairs = np.asarray(mesh.face_adjacency, dtype=np.int64)
     edges = np.asarray(mesh.face_adjacency_edges)
     v = np.asarray(mesh.vertices)
@@ -287,8 +287,19 @@ def snap_gumline(mesh: trimesh.Trimesh, labels: Labels) -> Labels:
     h = concavity(mesh)[edges].mean(axis=1)
     length = np.linalg.norm(v[edges[:, 0]] - v[edges[:, 1]], axis=1)
     cost = length * (np.exp(-((np.minimum(h, 0.0) / GUMLINE_SIGMA_MM) ** 2)) + 1e-3)
-    n = len(labels)
     step = np.linalg.norm(centers[pairs[:, 0]] - centers[pairs[:, 1]], axis=1)
+    return pairs, cost, step
+
+
+def snap_gumline(mesh: trimesh.Trimesh, labels: Labels) -> Labels:
+    """Move the tooth/gingiva boundary onto the gingival crease.
+
+    The CT-derived labels put the boundary about 0.5 mm onto the gingiva (the CT blurs the
+    tooth neck). A binary min-cut over the faces near the boundary, with edge costs that
+    almost vanish along concave creases, snaps it onto the real gumline. Faces deep inside
+    a crown stay tooth and faces far out on the gingiva stay gingiva."""
+    pairs, cost, step = _crease_cost(mesh)
+    n = len(labels)
     graph = sparse.csr_matrix(
         (np.r_[step, step], (np.r_[pairs[:, 0], pairs[:, 1]], np.r_[pairs[:, 1], pairs[:, 0]])),
         shape=(n, n),
@@ -337,6 +348,60 @@ def snap_gumline(mesh: trimesh.Trimesh, labels: Labels) -> Labels:
     return out
 
 
+def snap_interproximal(mesh: trimesh.Trimesh, labels: Labels) -> Labels:
+    """Move every boundary between two adjacent crowns onto their interproximal crease.
+
+    The blurred CT lets one crown's label run along the neighbor's incisal edge or marginal
+    ridge as a thin strip; that strip then moves with the wrong tooth and props the two crowns
+    apart. Per pair of touching crowns, a binary min-cut in a band around their boundary
+    (cutting is almost free along concave creases, relabeling costs a little per mm^2) cuts
+    such strips off at their root and follows the embrasure."""
+    pairs, cost, step = _crease_cost(mesh)
+    area = np.asarray(mesh.area_faces)
+    out = labels.copy()
+    n = len(labels)
+    la, lb = out[pairs[:, 0]], out[pairs[:, 1]]
+    touching = (la > 0) & (lb > 0) & (la != lb)
+    combos = {tuple(sorted(p)) for p in np.stack([la[touching], lb[touching]], axis=1).tolist()}
+    for a, b in sorted(combos):
+        mine = (out == a) | (out == b)
+        inner = mine[pairs[:, 0]] & mine[pairs[:, 1]]
+        p_in = pairs[inner]
+        graph = sparse.csr_matrix(
+            (
+                np.r_[step[inner], step[inner]],
+                (np.r_[p_in[:, 0], p_in[:, 1]], np.r_[p_in[:, 1], p_in[:, 0]]),
+            ),
+            shape=(n, n),
+        )
+        cross = p_in[out[p_in[:, 0]] != out[p_in[:, 1]]]
+        if not len(cross):
+            continue
+        dist = dijkstra(graph, indices=np.unique(cross), min_only=True, limit=INTERPROXIMAL_BAND_MM)
+        band = mine & np.isfinite(dist)
+        nodes = np.flatnonzero(band)
+        index = np.full(n, -1)
+        index[nodes] = np.arange(len(nodes))
+        # cost of each label: relabeling, plus the cut to the fixed faces outside the band
+        if_a = np.where(out[nodes] == b, RELABEL_COST_PER_MM2 * area[nodes], 0.0)
+        if_b = np.where(out[nodes] == a, RELABEL_COST_PER_MM2 * area[nodes], 0.0)
+        c_in = cost[inner]
+        both = band[p_in[:, 0]] & band[p_in[:, 1]]
+        for i, j in ((0, 1), (1, 0)):
+            rim = band[p_in[:, i]] & ~band[p_in[:, j]]
+            f, fixed = index[p_in[rim, i]], out[p_in[rim, j]]
+            np.add.at(if_a, f, np.where(fixed == b, c_in[rim], 0.0))
+            np.add.at(if_b, f, np.where(fixed == a, c_in[rim], 0.0))
+        g = maxflow.Graph[float]()
+        ids = g.add_nodes(len(nodes))
+        e = p_in[both]
+        g.add_edges(index[e[:, 0]], index[e[:, 1]], c_in[both], c_in[both])
+        g.add_grid_tedges(ids, if_b, if_a)  # source = a: its t-link is cut when b is chosen
+        g.maxflow()
+        out[nodes] = np.where(g.get_grid_segments(ids), b, a)
+    return out
+
+
 def run_segment(case: Case) -> dict[str, Any]:
     from aligners.register import bite_disagreement, load_ct_teeth, register_jaw
     from aligners.scan import arch_frame, cusp_plane_leveling, load_scan, scanner_bite
@@ -379,6 +444,7 @@ def run_segment(case: Case) -> dict[str, Any]:
         values, unary = ct_unaries(arch_mesh, crowns)
         labels = snap_gumline(arch_mesh, refine(arch_mesh, values, unary))
         labels, warnings = cleanup(arch_mesh, labels)
+        labels = snap_interproximal(arch_mesh, labels)
         labels, dropped = drop_partial_crowns(arch_mesh, labels)
         labels = fill_enclosed_gum(arch_mesh, labels)
         level, level_deg = cusp_plane_leveling(arch_mesh, labels)

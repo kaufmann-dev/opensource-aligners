@@ -78,6 +78,20 @@ def rotation_deg(tooth: Tooth, ideal: ArchCurve, jaw: Jaw) -> float:
     return float(np.degrees(np.arctan2(np.dot(m, ideal_b), np.dot(m, ideal_m))))
 
 
+def incisor_inclination(anatomy: JawAnatomy, poses: dict[int, Array] | None = None) -> float | None:
+    """Mean central incisor long axis against the perpendicular to the arch's own occlusal plane,
+    in degrees, + = crown labial (Downs norms: upper ~30, lower ~15)."""
+    teeth = posed_teeth(anatomy, poses)
+    angles = []
+    for n, t in teeth.items():
+        if fdi.position(n) != 1:
+            continue
+        b = np.array([t.b[0], t.b[1], 0.0])
+        b /= np.linalg.norm(b)
+        angles.append(float(np.degrees(np.arctan2(t.o @ b, t.o[2]))))
+    return float(np.mean(angles)) if angles else None
+
+
 def fit_occlusal_curve(points: Array) -> tuple[float, float]:
     """z = c0 + c2 x^2 through cusp tips (symmetric curve of Spee proxy)."""
     x, z = points[:, 0], points[:, 2]
@@ -93,35 +107,15 @@ def _pair_sum(teeth: dict[int, Tooth], jaw: Jaw, positions: range) -> float | No
     return float(sum(teeth[n].width for n in numbers))
 
 
-def analyze_jaw(anatomy: JawAnatomy, poses: Poses | None = None) -> dict[str, Any]:
+def analyze_jaw(anatomy: JawAnatomy, goals: dict[str, Any]) -> dict[str, Any]:
+    from aligners.setup import arch_discrepancy
+
     jaw = anatomy.jaw
-    teeth = posed_teeth(anatomy, poses)
+    teeth = posed_teeth(anatomy)
     order = anatomy.order()
-    curve = ArchCurve(
-        np.array([((teeth[n].mesial_contact + teeth[n].distal_contact) / 2)[:2] for n in order])
-    )
     right = patient_right_sign(jaw)
     ideal = ideal_arch_form(teeth).curve()
-
-    # Space: on the ideal arch (symmetric anteriorly, meeting the first molars), walk each
-    # side's teeth contact to contact from the arch midline and compare with where the first
-    # molars' mesial contacts are. Positive = crowding (the same measure the setup balances).
-    s_mid = float(ideal.project(np.array([0.0, ideal.point(0.0)[1]]))[0])
-    curve_used = curve
-    curve = ideal
-    available = required = 0.0
-    for patient_right in (True, False):
-        side_teeth = [n for n in order if fdi.is_patient_right(n) == patient_right]
-        molar = fdi.fdi_number(jaw, patient_right, 6)
-        if molar not in teeth:
-            continue
-        direction = int(np.sign(float(curve.project(teeth[molar].mesial_contact[:2])[0]) - s_mid))
-        s = s_mid
-        for n in sorted((n for n in side_teeth if fdi.position(n) <= 5), key=fdi.position):
-            s = curve.chord_step(s, direction, teeth[n].width)
-        required += abs(s - s_mid)
-        available += abs(float(curve.project(teeth[molar].mesial_contact[:2])[0]) - s_mid)
-    curve = curve_used
+    by_side = arch_discrepancy(anatomy, goals)
     cusps = np.array([teeth[n].cusp for n in order])
     c0, c2 = fit_occlusal_curve(cusps)
 
@@ -141,12 +135,10 @@ def analyze_jaw(anatomy: JawAnatomy, poses: Poses | None = None) -> dict[str, An
     return {
         "teeth": order,
         "widths_mm": {n: teeth[n].width for n in order},
-        "arch_curve": curve.as_dict(),
-        "available_mm": available,
-        "required_mm": required,
-        "discrepancy_mm": required - available,
+        "discrepancy_mm": sum(by_side.values()),
+        "discrepancy_by_side_mm": by_side,
         "discrepancy_meaning": "positive = crowding, negative = spacing",
-        "contacts_mm": contact_gaps(anatomy, poses),
+        "contacts_mm": contact_gaps(anatomy),
         "rotation_deg": {n: rotation_deg(teeth[n], ideal, jaw) for n in order},
         "level_deviation_mm": {
             n: float(teeth[n].cusp[2] - (c0 + c2 * teeth[n].cusp[0] ** 2)) for n in order
@@ -155,6 +147,7 @@ def analyze_jaw(anatomy: JawAnatomy, poses: Poses | None = None) -> dict[str, An
         "intercanine_mm": width_between(3),
         "intermolar_mm": width_between(6),
         "midline_offset_left_mm": midline_left,
+        "incisor_inclination_deg": incisor_inclination(anatomy),
         "anterior_sum_mm": _pair_sum(teeth, jaw, range(1, 4)),
     }
 
@@ -171,36 +164,6 @@ def final_arch_to_bite(case: Case) -> dict[Jaw, Array]:
     """Arch -> bite transforms of the planned result: after surgery in the surgical modes."""
     setup = read_json(case.require(case.work / "setup.json", "setup"))
     return {jaw: np.asarray(setup["arch_to_bite_final"][jaw], float) for jaw in JAWS}
-
-
-def analyze_face(case: Case, anatomies: dict[Jaw, JawAnatomy]) -> dict[str, Any]:
-    """Jaw positions against the facial midline and the head horizontal (pre-treatment)."""
-    from aligners.surgery import (
-        dental_landmarks,
-        head_frames,
-        incisor_angles,
-        jaw_angles,
-        mandible_landmarks,
-        to_head,
-    )
-
-    hf = head_frames(case, case.plan(), anatomies)
-    mand = mandible_landmarks(case, hf, anatomies["lower"])
-    out: dict[str, Any] = {
-        "maxilla": jaw_angles(to_head(hf.P["upper"], dental_landmarks(anatomies["upper"]))),
-        "mandible": jaw_angles(to_head(hf.P["lower"], dental_landmarks(anatomies["lower"]))),
-        "incisors": incisor_angles(anatomies, hf.P, mand),
-        "chin_mm": {k: float(-mand[k][0]) for k in ("pogonion", "menton") if k in mand},
-        "symmetry_rmse_mm": read_json(case.ct_dir / "skull.json")["symmetry_rmse_mm"],
-        "meaning": "head frame; midline/chin + = patient left, cant + = left side up, "
-        "pitch + = anterior up, yaw + = incisors toward patient left",
-    }
-    for side in ("right", "left"):
-        if f"condylion_{side}" in mand and f"gonion_{side}" in mand:
-            out.setdefault("ramus_height_mm", {})[side] = float(
-                np.linalg.norm(mand[f"condylion_{side}"] - mand[f"gonion_{side}"])
-            )
-    return out
 
 
 def analyze_bite(
@@ -278,7 +241,7 @@ def analyze_bite(
 def run_analyze(case: Case) -> dict[str, Any]:
     anatomies = {jaw: JawAnatomy.load(case.anatomy_dir(jaw), jaw) for jaw in case.jaws()}
     result: dict[str, Any] = {
-        "jaws": {j: analyze_jaw(a) for j, a in anatomies.items()},
+        "jaws": {j: analyze_jaw(a, case.plan()["goals"]) for j, a in anatomies.items()},
         "warnings": [],
     }
     to_bite = arch_to_bite(case)
@@ -291,7 +254,5 @@ def run_analyze(case: Case) -> dict[str, Any]:
     else:
         result["bite"] = None
         result["warnings"].append("bite unavailable: no CT and scans are not bite-registered")
-    if (case.ct_dir / "skull.json").exists() and to_bite:
-        result["face"] = analyze_face(case, anatomies)
     write_json(case.work / "analysis.json", result)
     return result

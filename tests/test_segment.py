@@ -100,3 +100,40 @@ def test_fill_enclosed_gum_fills_holes_in_one_crown_only():
     assert np.all(out[hole] == 21)
     assert np.all(out[between] == 0)
     assert np.all(out[c[:, 2] < -1.0] == 0)
+
+
+def _grid(nx: int, ny: int, step: float) -> trimesh.Trimesh:
+    xs, ys = np.meshgrid(np.arange(nx) * step, np.arange(ny) * step, indexing="ij")
+    v = np.stack([xs.ravel(), ys.ravel(), np.zeros(xs.size)], axis=1)
+    idx = np.arange(nx * ny).reshape(nx, ny)
+    a, b, c, d = (
+        idx[:-1, :-1].ravel(),
+        idx[1:, :-1].ravel(),
+        idx[1:, 1:].ravel(),
+        idx[:-1, 1:].ravel(),
+    )
+    return trimesh.Trimesh(v, np.r_[np.stack([a, b, c], 1), np.stack([a, c, d], 1)], process=False)
+
+
+def test_snap_interproximal_cuts_a_strip_off_at_its_root():
+    from aligners.segment import snap_interproximal
+
+    mesh = _grid(81, 41, 0.25)  # 20 x 10 mm, two crowns split at x = 10
+    c = mesh.triangles_center
+    labels = np.where(c[:, 0] < 10.0, 11, 21)
+    strip = (c[:, 0] >= 10.0) & (c[:, 0] < 14.0) & (np.abs(c[:, 1] - 5.0) < 0.3)
+    labels[strip] = 11  # crown 11 runs 4 mm along crown 21 as a thin strip
+    out = snap_interproximal(mesh, labels)
+    assert (out[strip] == 21).mean() > 0.95
+    assert np.all(out[c[:, 0] < 9.0] == 11) and np.all(out[c[:, 0] > 11.0] == 21)
+
+
+def test_cleanup_fills_a_thin_island_from_all_sides():
+    mesh = _grid(81, 41, 0.25)
+    c = mesh.triangles_center
+    labels = np.where(c[:, 0] < 10.0, 11, 21)
+    island = (c[:, 0] >= 10.5) & (c[:, 0] < 14.0) & (np.abs(c[:, 1] - 5.0) < 0.3)
+    labels[island] = 11  # a separate small region of 11 inside 21
+    labels[(c[:, 0] >= 10.0) & (c[:, 0] < 10.5) & (np.abs(c[:, 1] - 5.0) < 0.3)] = 21
+    out, _ = cleanup(mesh, labels)
+    assert np.all(out[island] == 21)

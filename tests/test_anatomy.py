@@ -102,21 +102,32 @@ def test_incisal_edge_follows_a_sloped_edge_not_the_long_axis():
     assert abs(np.degrees(np.arctan2(e[2], e[0])) - np.degrees(np.arctan(1 / 8))) < 1.0
 
 
-def test_facial_normal_converges_on_a_rotated_canine_like_crown():
-    from aligners.anatomy import facial_normal
+def test_arch_form_is_smooth_through_the_incisors_and_ignores_a_displaced_tooth():
+    from aligners.anatomy import fit_arch_form
 
-    # canine-like crown: near-round outline, but a broad flat labial face (+y)
-    cap = trimesh.creation.icosphere(subdivisions=4, radius=1.0)
-    cap.apply_scale([3.5, 3.75, 5.0])
-    v = cap.vertices.copy()
-    v[v[:, 1] > 0, 1] *= 0.55
-    cap.vertices = v
-    cap = submesh(cap, cap.triangles_center[:, 2] > -2.0)
-    for degrees in (15.0, 30.0, 45.0):
-        rotated = _rotated(cap, degrees)
-        solid = close_crown(rotated, np.array([0.0, 0.0, 1.0]))
-        b = facial_normal(
-            solid, len(rotated.faces), np.array([0.0, 0.0, 1.0]), np.array([0.0, 1.0, 0.0])
+    # contact points on a symmetric U-shaped arch, one tooth blocked out 3 mm lingually
+    t = np.linspace(0.0, 1.0, 9)
+    half = np.stack([26.0 * np.sin(1.4 * t), -40.0 * t**1.6 - 1.0], axis=1)
+    pts = np.vstack([half, half[1:] * [-1.0, 1.0]])
+    normal = np.array([np.sin(1.4 * 0.375), 0.5])
+    pts_bad = pts.copy()
+    pts_bad[3] -= 3.0 * normal / np.linalg.norm(normal)
+    anchors = {1: half[-2], -1: half[-2] * [-1.0, 1.0]}
+    form = fit_arch_form(pts_bad, np.ones(len(pts)), -1.0, anchors, np.array([half[3]]))
+    curve = form.curve()
+    assert abs(curve.point(0.0)[1] + 1.0) < 0.05 and abs(curve.point(0.0)[0]) < 0.05
+    assert np.all(form.kappa >= 0.0)
+    dev = [
+        abs(
+            float(
+                (p - curve.point(curve.project(p)[0]))
+                @ curve.outward(float(curve.project(p)[0]))[:2]
+            )
         )
-        expected = np.array([-np.sin(np.radians(degrees)), np.cos(np.radians(degrees)), 0.0])
-        assert np.degrees(np.arccos(np.clip(np.dot(b, expected), -1, 1))) < 2.0
+        for p in np.delete(pts, 3, axis=0)
+    ]
+    assert max(dev) < 0.6
+    s3 = float(curve.project(pts[3])[0])
+    assert np.linalg.norm(curve.point(s3) - pts[3]) < 0.8  # the displaced tooth comes back
+    moved = form.curve(1.0)
+    assert abs(moved.point(0.0)[1] - curve.point(0.0)[1] - 1.0) < 0.05

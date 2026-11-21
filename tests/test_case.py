@@ -12,7 +12,7 @@ def test_plan_template_defaults_to_no_surgery(tmp_path):
     plan = _plan(tmp_path, "")
     assert plan["surgery"]["mode"] == "none"
     assert plan["surgery"]["maxilla"] == {} and plan["surgery"]["mandible"] == {}
-    assert plan["surgery"]["auto"]["osteotomies"] == ["lefort1", "bsso"]
+    assert plan["surgery"]["auto"]["move"] == "mandible"
 
 
 def test_surgery_tables_merge_defaults(tmp_path):
@@ -34,7 +34,7 @@ def test_surgery_tables_merge_defaults(tmp_path):
     ("old", "new", "message"),
     [
         ('mode = "none"', 'mode = "both"', "surgery.mode"),
-        ('osteotomies = ["lefort1", "bsso"]', 'osteotomies = ["genio"]', "osteotomies"),
+        ('move = "mandible"', 'move = "chin"', "surgery.auto.move"),
         (
             "# incisor_midline = { forward_mm = 4.0, up_mm = 0.0, left_mm = 0.0 }",
             "pogonion = { forward_mm = 4.0 }",

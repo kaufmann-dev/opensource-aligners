@@ -23,7 +23,7 @@ from aligners.motion import Movement, compose, decompose
 from aligners.scan import patient_right_sign
 
 if TYPE_CHECKING:
-    from aligners.surgery import HeadFrames
+    from aligners.surgery import DentalFrames
 
 BONE = {"upper": "maxilla", "lower": "mandible"}
 
@@ -40,6 +40,7 @@ CONTACT_TOLERANCE_MM = 0.05
 WARN_TRANSLATION_MM = 4.0
 WARN_ROTATION_DEG = 30.0
 WARN_TIP_TORQUE_DEG = 15.0
+MAX_INOUT_MM = 1.0  # largest natural bucco-lingual offset of a tooth type from the ideal arch
 
 
 @dataclass
@@ -101,10 +102,10 @@ class JawSolver:
         vertical: Array | None = None,
         incisor_axes: dict[int, Array] | None = None,
     ):
-        """`vertical`: the shared frontal-view vertical in this arch frame (the lower arch's
-        occlusal normal, or the head's vertical after surgery), against which incisal edges are
-        leveled in both arches. `incisor_axes`: decompensated crownward long axes (arch frame)
-        the incisors are torqued to, whatever `harmonize_inclination` says."""
+        """`vertical`: the frontal-view vertical in this arch frame (the lower arch's occlusal
+        normal for both arches; default: this arch's own), against which incisal edge slopes
+        are measured. `incisor_axes`: decompensated crownward long axes (arch frame) the
+        incisors are torqued to, whatever `harmonize_inclination` says."""
         self.a = anatomy
         self.vertical = np.array([0.0, 0.0, 1.0]) if vertical is None else vertical
         self.jaw = anatomy.jaw
@@ -128,6 +129,7 @@ class JawSolver:
         self._space_samples: dict[tuple[float, float], list[dict[int, float]]] = {}
         self._anchor_poses: dict[int, Array] = {}
         self.inclination_target = self._inclination_targets()
+        self.inout = self._inout_offsets()
         self.decompensate: set[int] = set()
         if incisor_axes:
             curve = self.base_form().curve()
@@ -142,6 +144,7 @@ class JawSolver:
             for n, t in self.teeth.items()
             if fdi.position(n) <= 2
         }
+        self.edge_slope = self._edge_slope_targets()
 
     # -- geometry helpers ---------------------------------------------------------------------
     def mid(self, t: Tooth) -> Array:
@@ -168,6 +171,44 @@ class JawSolver:
             self._anchor_poses[n] = self._place(
                 t, side, curve, s_mesial, s_distal, level(n, arc), adjust, anchor=True
             )
+
+    def _edge_slope_targets(self) -> dict[int, float]:
+        """Incisal edge slope (radians, + = mesial end toward the occlusal plane) in the frontal
+        view, the mean of the left and right tooth: the smile line becomes symmetric. Edges are
+        not forced horizontal, since the rounded distal corner of a lateral incisor lowers its
+        edge distally at its natural tip."""
+        slope = {
+            n: float(np.arcsin(np.clip(e @ self.vertical, -1.0, 1.0)))
+            for n, e in self.edges.items()
+        }
+        out = {}
+        for n in slope:
+            other = fdi.fdi_number(self.jaw, not fdi.is_patient_right(n), fdi.position(n))
+            out[n] = 0.5 * (slope[n] + slope[other]) if other in slope else slope[n]
+        return out
+
+    def _inout_offsets(self) -> dict[int, float]:
+        """Bucco-lingual offset (+ = buccal) of each tooth from the smooth ideal arch that the
+        setup keeps. Held teeth keep their own. The others keep their tooth type's natural
+        in/out (e.g. premolars set in from the canines), the mean of the left and right tooth,
+        capped: a single displaced tooth comes onto the arch of its homolog. Measured against
+        the arch without expansion, so expansion still widens the arch."""
+        curve = ideal_arch_form(self.teeth, {}, self.anchors).curve()
+        dev = {}
+        for n, t in self.teeth.items():
+            s_m = float(curve.project(t.mesial_contact[:2])[0])
+            s_d = float(curve.project(t.distal_contact[:2])[0])
+            chord_mid = 0.5 * (curve.point(s_m) + curve.point(s_d))
+            dev[n] = float((self.mid(t)[:2] - chord_mid) @ curve.outward(0.5 * (s_m + s_d))[:2])
+        out = {}
+        for n in self.teeth:
+            if n in self.anchors:
+                out[n] = dev[n]
+                continue
+            other = fdi.fdi_number(self.jaw, not fdi.is_patient_right(n), fdi.position(n))
+            mean = 0.5 * (dev[n] + dev[other]) if other in dev else dev[n]
+            out[n] = float(np.clip(mean, -MAX_INOUT_MM, MAX_INOUT_MM))
+        return out
 
     def _inclination_targets(self) -> dict[int, float]:
         """Bucco-lingual inclination (radians, + = crown outward) shared by homologous teeth:
@@ -577,7 +618,10 @@ class JawSolver:
         the arch (e.g. with expansion), keeping their rotation, height and inclination."""
         g = self.goals
         p = self.mid(t)
-        target_xy = (curve.point(s_mesial) + curve.point(s_distal)) / 2
+        out_mid = curve.outward(0.5 * (s_mesial + s_distal))
+        target_xy = (curve.point(s_mesial) + curve.point(s_distal)) / 2 + self.inout[
+            t.fdi
+        ] * out_mid[:2]
         target_dir = curve.chord(s_mesial, s_distal)[:2]
         # The last tooth of each side has no distal neighbor, so its measured rotation is only
         # an estimate from the arch direction: keep it rather than "correct" it.
@@ -611,12 +655,12 @@ class JawSolver:
             o_now = R[:3, :3] @ t.o
             now = float(np.arctan2(o_now @ out, o_now[2]))
             R = rotation_about(across, self.inclination_target[t.fdi] - now, t.cr) @ R
-        if g["level_incisal_edges"] and not anchor and fdi.position(t.fdi) <= 2:
-            # tip about the labial axis until the incisal edge is horizontal in frontal view
+        if g["harmonize_incisal_edges"] and not anchor and fdi.position(t.fdi) <= 2:
+            # tip about the labial axis until the incisal edge mirrors its homolog's
             e_now = R[:3, :3] @ self.edges[t.fdi]
             slope = float(np.arcsin(np.clip(e_now @ self.vertical, -1.0, 1.0)))
             labial = R[:3, :3] @ t.b
-            tip = _signed_tip(e_now, labial, -slope, self.vertical)
+            tip = _signed_tip(e_now, labial, self.edge_slope[t.fdi] - slope, self.vertical)
             R = rotation_about(labial, tip, t.cr) @ R
         p = transform_points(R, p[None])[0]
         if g["tipping"] and not anchor:
@@ -694,6 +738,19 @@ class JawSolver:
                 setup.warnings.append(f"contact {a}-{b}: {excess:.2f} mm overlap remains")
 
 
+def arch_discrepancy(anatomy: JawAnatomy, goals: dict[str, Any]) -> dict[str, float]:
+    """Crowding (+) or spacing (-) per side in mm: what is left against the held teeth when
+    every crown is aligned on the ideal arch through the current incisors, each touching its
+    neighbor, without IPR or incisor movement (the measure the setup balances)."""
+    solver = JawSolver(anatomy, goals, {})
+    curve = solver.base_form().curve(0.0)
+    level = solver._level_target(curve)
+    solver._place_anchors(curve, level, Adjust())
+    _, ends = solver._walk(curve, 0.0, level, Adjust(), {}, {})
+    right = patient_right_sign(anatomy.jaw)
+    return {("right" if side == right else "left"): -end for side, end in ends.items()}
+
+
 def _jaw_report(anatomy: JawAnatomy, setup: JawSetup) -> dict[str, Any]:
     teeth = {}
     for n in anatomy.order():
@@ -764,11 +821,12 @@ def settle_bite(
             and bite["align_midlines"]
             and abs(metrics.get("midline_upper_vs_lower_left_mm", 0.0)) > 0.05
         ):
-            # + means the upper midline lies to the patient's left; the upper arch frame's +x
-            # points to the patient's left, so the upper segment moves by the negative amount
-            adjust_u.midline_x = (
-                setups["upper"].midline_x - metrics["midline_upper_vs_lower_left_mm"]
-            )
+            # + means the upper midline lies to the patient's left: it moves half the way right
+            # (-x in the upper arch frame) and the lower one half the way left (-x in the lower
+            # arch frame)
+            half = 0.5 * metrics["midline_upper_vs_lower_left_mm"]
+            adjust_u.midline_x = setups["upper"].midline_x - half
+            adjust_l.midline_x = setups["lower"].midline_x - half
             changed = True
         # new occlusal interferences: intrude both teeth of the pair (and their left/right
         # counterparts, so the arch stays symmetric) by half the excess each, within a cap
@@ -852,19 +910,14 @@ def _verticals(to_bite: dict[Jaw, Array]) -> dict[Jaw, Array]:
     return {"lower": np.array([0.0, 0.0, 1.0]), "upper": up_to_low.T @ [0.0, 0.0, 1.0]}
 
 
-def _head_verticals(Q: dict[Jaw, Array]) -> dict[Jaw, Array]:
-    """The head's vertical (after surgery) in each arch frame."""
-    return {jaw: Q[jaw][:3, :3].T @ np.array([0.0, 0.0, 1.0]) for jaw in Q}
-
-
 def _solve_orthodontic(
     anatomies: dict[Jaw, JawAnatomy],
     plan: dict[str, Any],
     to_bite: dict[Jaw, Array],
-    vertical: dict[Jaw, Array],
     baseline: dict[tuple[int, int], float],
 ) -> Setups:
     goals = plan["goals"]
+    vertical = _verticals(to_bite)
     solvers = {
         jaw: JawSolver(a, goals, plan["teeth"], vertical[jaw]) for jaw, a in anatomies.items()
     }
@@ -874,90 +927,67 @@ def _solve_orthodontic(
 
 
 def _solve_auto(
-    case: Case, anatomies: dict[Jaw, JawAnatomy], plan: dict[str, Any]
-) -> tuple[Setups, dict[str, Array], dict[str, Any], "HeadFrames"]:
-    """Decompensated arches, then the jaw movements of their ideal occlusion (see surgery.py)."""
+    anatomies: dict[Jaw, JawAnatomy], plan: dict[str, Any], frames: "DentalFrames"
+) -> tuple[Setups, dict[str, Array], dict[str, Any]]:
+    """Each arch aligned on its own jaw, incisors decompensated to their target inclinations
+    (no compensation for the other jaw), then the movement of one jaw into their ideal
+    occlusion (see surgery.py)."""
     from aligners.surgery import (
         Occlusion,
-        dental_landmarks,
-        distribute,
-        head_frames,
+        arch_to_bite_after,
         incisor_target_axes,
-        mandible_landmarks,
-        mandibular_plane_normal,
+        movements_for_relation,
     )
 
     goals = plan["goals"]
     cfg = plan["surgery"]["auto"]
-    hf = head_frames(case, plan, anatomies)
-    mand = mandible_landmarks(case, hf, anatomies["lower"])
-    mp = mandibular_plane_normal(mand)
-    X = np.linalg.inv(hf.P["lower"]) @ hf.P["upper"]
-    Q = dict(hf.P)
-    M = {"maxilla": np.eye(4), "mandible": np.eye(4)}
-    warnings: list[str] = []
+    axes = incisor_target_axes(anatomies, cfg)
+    solvers = {
+        jaw: JawSolver(a, goals, plan["teeth"], None, axes[jaw]) for jaw, a in anatomies.items()
+    }
+    adjust = {
+        jaw: Adjust(delta=s.decompensation_delta(), reason="incisor decompensation")
+        for jaw, s in solvers.items()
+    }
+    setups = {jaw: solvers[jaw].solve(adjust[jaw]) for jaw in solvers}
+    X = np.linalg.inv(frames.to_bite["lower"]) @ frames.to_bite["upper"]
     occlusion: dict[str, Any] = {}
-    setups: Setups = {}
-    solvers: dict[Jaw, JawSolver] = {}
-    adjust: dict[Jaw, Adjust] = {}
-
-    def place_jaws() -> None:
-        nonlocal X, occlusion
-        poses = {jaw: s.poses for jaw, s in setups.items()}
+    M: dict[str, Array] = {}
+    for _ in range(2):  # the jaw moves into the occlusion, the teeth settle in it
         occ = Occlusion(
             anatomies["upper"],
-            poses["upper"],
+            setups["upper"].poses,
             anatomies["lower"],
-            poses["lower"],
+            setups["lower"].poses,
             goals["bite"]["overjet_mm"],
         )
         X, occlusion = occ.solve(X)
-        up_lm = dental_landmarks(anatomies["upper"], poses["upper"])
-        M["maxilla"], M["mandible"], dist_warnings = distribute(X, hf, cfg, up_lm, mand)
-        occlusion["warnings"] += dist_warnings
-        Q["upper"] = M["maxilla"] @ hf.P["upper"]
-        Q["lower"] = M["mandible"] @ hf.P["lower"]
-
-    for _ in range(2):
-        vertical = _head_verticals(Q)
-        axes = incisor_target_axes(anatomies, Q, mp, cfg)
-        if mp is None:
-            warnings.append("mandibular plane not found: lower incisors keep their inclination")
-        solvers = {
-            jaw: JawSolver(a, goals, plan["teeth"], vertical[jaw], axes.get(jaw))
-            for jaw, a in anatomies.items()
-        }
-        adjust = {
-            jaw: Adjust(delta=s.decompensation_delta(), reason="incisor decompensation")
-            for jaw, s in solvers.items()
-        }
-        setups = {jaw: solvers[jaw].solve(adjust[jaw]) for jaw in solvers}
-        place_jaws()
-    settle_bite(anatomies, solvers, setups, adjust, Q, goals, {}, couple=False)
-    place_jaws()
+        M = movements_for_relation(X, frames, cfg["move"])
+        # occlusal interferences and the minimum overbite in the new relation
+        after = arch_to_bite_after(frames, M)
+        settle_bite(anatomies, solvers, setups, adjust, after, goals, {}, couple=False)
     extra = {
-        "osteotomies": list(cfg["osteotomies"]),
-        "bsso": "bsso" in cfg["osteotomies"],
+        "moved": cfg["move"],
         "occlusion": occlusion,
-        "warnings": sorted(set(warnings + occlusion.pop("warnings"))),
+        "warnings": occlusion.pop("warnings"),
     }
-    return setups, M, extra, hf
+    return setups, M, extra
 
 
-def _surgical_frames(
-    case: Case, anatomies: dict[Jaw, JawAnatomy], plan: dict[str, Any]
-) -> tuple[dict[str, Array], dict[str, Any], "HeadFrames"]:
-    """Manual mode: the surgeon's movement tables as head-frame jaw movements."""
-    from aligners.surgery import dental_landmarks, head_frames, table_to_transform, to_head
+def _solve_manual(
+    anatomies: dict[Jaw, JawAnatomy], plan: dict[str, Any], frames: "DentalFrames"
+) -> tuple[dict[str, Array], dict[str, Any]]:
+    """Manual mode: the surgeon's movement tables as jaw movements in the movement frame."""
+    from aligners.surgery import dental_landmarks, table_to_transform, to_frame
 
-    hf = head_frames(case, plan, anatomies)
     M: dict[str, Array] = {}
     residuals: dict[str, dict[str, float]] = {}
     for jaw, bone in (("upper", "maxilla"), ("lower", "mandible")):
-        pre = to_head(hf.P[jaw], dental_landmarks(anatomies[jaw]))
+        pre = to_frame(frames.P[jaw], dental_landmarks(anatomies[jaw]))
         M[bone], residuals[bone] = table_to_transform(plan["surgery"][bone], pre, bone)
+    moved = [bone for bone in M if plan["surgery"][bone]]
     extra = {
-        "bsso": bool(plan["surgery"]["mandible"]),
+        "moved": " and ".join(moved) if moved else "none",
         "fit_residual_mm": residuals,
         "warnings": [
             f"surgery.{bone}.{name}: {r:.1f} mm off the rigid movement through the other points"
@@ -966,7 +996,7 @@ def _surgical_frames(
             if r > 0.3
         ],
     }
-    return M, extra, hf
+    return M, extra
 
 
 def run_setup(case: Case) -> dict[str, Any]:
@@ -987,23 +1017,22 @@ def run_setup(case: Case) -> dict[str, Any]:
     if mode == "none":
         initial = analyze_bite(anatomies["upper"], anatomies["lower"], to_bite)
         baseline = {(i["lower"], i["upper"]): i["depth_mm"] for i in initial["interferences"]}
-        setups = _solve_orthodontic(anatomies, plan, to_bite, _verticals(to_bite), baseline)
+        setups = _solve_orthodontic(anatomies, plan, to_bite, baseline)
         final_bite = to_bite
     else:
-        from aligners.surgery import surgery_report
+        from aligners.surgery import arch_to_bite_after, dental_frames, surgery_report
 
+        frames = dental_frames(case, plan)
         if mode == "manual":
-            M, extra, hf = _surgical_frames(case, anatomies, plan)
-            final_bite = {jaw: M[BONE[jaw]] @ hf.P[jaw] for jaw in hf.P}
+            M, extra = _solve_manual(anatomies, plan, frames)
+            final_bite = arch_to_bite_after(frames, M)
             # pre-existing contacts mean nothing in a new jaw relation: no interference baseline
-            setups = _solve_orthodontic(
-                anatomies, plan, final_bite, _head_verticals(final_bite), {}
-            )
+            setups = _solve_orthodontic(anatomies, plan, final_bite, {})
         else:
-            setups, M, extra, hf = _solve_auto(case, anatomies, plan)
-            final_bite = {jaw: M[BONE[jaw]] @ hf.P[jaw] for jaw in hf.P}
+            setups, M, extra = _solve_auto(anatomies, plan, frames)
+            final_bite = arch_to_bite_after(frames, M)
         final = {jaw: s.poses for jaw, s in setups.items()}
-        surgery = surgery_report(case, plan, anatomies, hf, M, final, extra)
+        surgery = surgery_report(plan, anatomies, frames, M, final, extra)
         result["warnings"] += [f"surgery: {w}" for w in extra["warnings"]]
     result["jaws"] = {jaw: _jaw_report(anatomies[jaw], s) for jaw, s in setups.items()}
     for jaw, s in setups.items():

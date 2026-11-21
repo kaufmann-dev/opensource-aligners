@@ -14,25 +14,31 @@ aligners for every stage.
    The result provides crown shapes, roots and bone.
 2. **Segment**: finds each scan's arch frame, levels it to the occlusal plane, registers the CT
    teeth onto the scan and labels every scan face with its FDI tooth number (0 = gingiva).
-   - The tooth/gingiva boundary is snapped onto the gingival crease.
+   - The tooth/gingiva boundary is snapped onto the gingival crease, and every boundary between
+     two touching crowns onto their interproximal crease.
    - The bite comes from bite-registered scans, else from the CT.
-3. **Analyze**: measures crowding/spacing, rotations, leveling, arch widths, midlines, overjet,
-   overbite, molar class and Bolton ratio.
+3. **Analyze**: measures crowding/spacing (with the setup's own contact walk), rotations,
+   leveling, arch widths, midlines, incisor inclinations, overjet, overbite, molar class and
+   Bolton ratio.
 4. **Setup**: solves the target tooth positions from treatment goals in `plan.toml`.
-   - It uses an ideal arch that hugs the outermost teeth, with incisor advancement before IPR.
-   - It corrects inclination by tipping, levels the incisal edges and aligns the midlines.
+   - It uses a smooth, symmetric ideal arch through the current incisors and the held molars,
+     fitted robustly so that displaced teeth come onto the arch of the others. Each tooth type
+     keeps its natural in/out offset. Incisor advancement comes before IPR.
+   - It corrects inclination by tipping and mirrors the incisal edges left to right. It aligns
+     the midlines, each arch moving half.
    - It keeps minimum overjet/overbite and clears occlusal interferences.
    - It coordinates both arches: lower IPR replaces proclination when the upper front would be
      left with spaces.
-5. **Surgery (optional)**: plans the teeth for the jaw position after orthognathic surgery
-   (Le Fort I, BSSO), with orthodontics before surgery.
-   - `auto` sets up each arch on its own jaw (decompensation) and solves the jaw movements for
-     an ideal occlusion and a level, centered maxilla.
+5. **Surgery (optional)**: plans the teeth for a jaw movement after orthognathic surgery, with
+   orthodontics before surgery. Only the teeth are used.
+   - `auto` aligns each arch on its own jaw, with the incisors at their target inclinations
+     (decompensation). It then finds how far one jaw has to move (forward/back, sideways,
+     up/down, rotated) for the two arches to fit ideally.
    - `manual` takes the surgeon's planned movements as a landmark table, e.g. the rows of a
      ProPlan CMF report, and fits the teeth to that jaw relation.
-   - The facial midline comes from the mirror symmetry of the cranium in the CT.
-   - Both write the jaw movements as a table, angles, transforms, landmarks and bone/teeth STLs
-     in DICOM coordinates.
+   - Both write the jaw movements as tables and angles in a frame of the upper occlusal plane,
+     plus transforms, landmarks and the teeth before/after surgery as STLs in DICOM
+     coordinates.
 6. **Stage**: splits the movement into aligner stages within per-stage limits and schedules
    teeth so neighbors never collide.
 7. **Check**: validates stage limits, collisions, registration, roots (proximity, bone), bite
@@ -64,8 +70,6 @@ A case needs:
   (bite-registered) give the most accurate bite.
 - **A CT of the jaws**: a DICOM folder (`--ct`) or an existing TotalSegmentator `teeth`
   labelmap (`--ct-seg`).
-- **Surgical modes only**: the CT image (`--ct`, also when `--ct-seg` is given) covering the
-  skull above the teeth (orbits, cranial base), so the facial midline can be found.
 
 ## Usage
 
@@ -91,27 +95,29 @@ Treatment goals, per-tooth overrides and the surgery mode live in `cases/me/plan
 is documented inline. Fabrication and staging parameters live in `cases/me/case.toml`.
 
 For a surgical case, set `[surgery] mode = "auto"` or `"manual"` in `plan.toml`:
-- `auto` chooses the jaw movements. `[surgery.auto]` sets which osteotomies it may use and the
-  maxilla's forward/vertical/pitch.
+- `auto` chooses the movement. `[surgery.auto]` sets which jaw moves (`move`, mandible by
+  default) and the decompensated incisor inclinations.
 - `manual` reads the movements from `[surgery.maxilla]` and `[surgery.mandible]`: the
   displacement of each landmark in mm, `forward_mm`, `up_mm` and `left_mm`. The landmarks are
   the incisor midline, both canines and both first molars.
+- Movements are given in a frame of the teeth: origin at the upper incisal midline, horizontal
+  along the upper occlusal plane. `[surgery] pitch_deg` tilts that horizontal, e.g. to match a
+  surgeon's planning software.
 
-`setup` then renders `work/renders/surgery.png`, and `analyze` reports the face metrics (cant,
-yaw, midlines, chin, incisor angles).
+`setup` then renders `work/renders/surgery.png` (teeth only).
 
 Outputs are written to `cases/me/out/`:
 - `<jaw>/aligner_NN.stl`, `<jaw>/model_NN.stl` and `<jaw>/template.stl`
 - `manifest.json`: wear order, IPR before stage 1, attachments
-- `preview.html`, with a before/after surgery view in the surgical modes
+- `preview.html`, with a before/after surgery toggle in the surgical modes
 - surgical modes, in `surgery/`:
   - `movements.toml`: the planned movements in the `plan.toml` input format;
-  - `movements.json`: tables, angles, transforms, split gaps;
-  - `landmarks.json`: named landmarks in CT coordinates, the head frame and the rule for turning
-    another planner's plan into a movement table. bimax-simulation's *Export aligner movements*
-    uses it;
-  - STLs of the maxilla, mandible segments, cranium and teeth before/after surgery, in CT DICOM
-    (LPS) coordinates.
+  - `movements.json`: tables, rotations, transforms, the occlusion reached;
+  - `landmarks.json`: named landmarks in CT coordinates, the movement frame's axes and the rule
+    for turning another planner's plan into a movement table. bimax-simulation's *Export
+    aligner movements* uses it;
+  - `<jaw>_teeth_before_surgery.stl` / `<jaw>_teeth_after_surgery.stl`: the planned teeth in CT
+    DICOM (LPS) coordinates.
 
 `cases/` is git-ignored: case folders contain medical data.
 

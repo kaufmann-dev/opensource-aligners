@@ -104,7 +104,7 @@ def segment(case: CaseArg, as_json: JsonOpt = False) -> None:
 
     def summary(r: dict[str, Any]) -> None:
         for jaw, info in r["jaws"].items():
-            console.print(f"{jaw} ({info['method']}): {' '.join(map(str, info['teeth']))}")
+            console.print(f"{jaw}: {' '.join(map(str, info['teeth']))}")
         console.print(f"bite: {r['bite'] or 'unavailable'}")
 
     _run(as_json, lambda: run_segment(Case(case)), summary)
@@ -140,7 +140,7 @@ def render_cmd(
     ],
     as_json: JsonOpt = False,
 ) -> None:
-    """Render PNGs (occlusal, frontal, right, left; surgery: head frame) into work/renders/."""
+    """Render PNGs (occlusal, frontal, right, left) into work/renders/."""
     from aligners.views import render_what
 
     _run(
@@ -195,24 +195,23 @@ def setup(case: CaseArg, as_json: JsonOpt = False) -> None:
 
 
 def _surgery_summary(s: dict[str, Any]) -> None:
-    console.print(f"surgery ({s['mode']}), mm forward / up / left at the scanned landmarks:")
+    console.print(
+        f"surgery ({s['mode']}, moved: {s['moved']}), mm forward / up / left at the scanned "
+        "landmarks:"
+    )
     for bone, table in s["movements"].items():
+        r = s["rotations"][bone]
+        if not any(any(m.values()) for m in table.values()) and max(map(abs, r.values())) < 0.05:
+            continue
         for name, m in table.items():
             console.print(
                 f"  {bone:8} {name:15} {m['forward_mm']:+5.1f} {m['up_mm']:+5.1f} "
                 f"{m['left_mm']:+5.1f}"
             )
-        a = s["angles"][bone]
-        change = ", ".join(
-            f"{k.removesuffix('_deg').removesuffix('_mm')} {a['before_surgery'][k]:+.1f}"
-            f" -> {v:+.1f}"
-            for k, v in a["after_surgery"].items()
-            if k in ("cant_deg", "yaw_deg", "occlusal_pitch_deg", "midline_mm")
+        console.print(
+            f"  {bone:8} pitch {r['pitch_deg']:+.1f}, roll {r['roll_deg']:+.1f}, "
+            f"yaw {r['yaw_deg']:+.1f} deg"
         )
-        console.print(f"  {bone:8} {change}")
-    if s["split_gap_mm"]:
-        gaps = ", ".join(f"{k} {v:+.1f}" for k, v in s["split_gap_mm"].items())
-        console.print(f"  split gap (+) / overlap (-) mm: {gaps}")
 
 
 @app.command()

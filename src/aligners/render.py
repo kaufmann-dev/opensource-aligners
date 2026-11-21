@@ -41,9 +41,15 @@ def label_colors(labels: NDArray[np.int64]) -> NDArray[np.uint8]:
 
 
 def _polydata(mesh: trimesh.Trimesh, face_colors: NDArray[np.uint8] | None) -> vtk.vtkPolyData:
-    pts = vtk.vtkPoints()
-    pts.SetData(numpy_to_vtk(np.ascontiguousarray(mesh.vertices, dtype=np.float64), deep=True))
+    """Polydata of a mesh. Face colors become point colors of unshared vertices: cell scalars
+    are drawn through texture buffers, which some headless OpenGL drivers render degenerate."""
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
     faces = np.asarray(mesh.faces, dtype=np.int64)
+    if face_colors is not None:
+        vertices = vertices[faces].reshape(-1, 3)
+        faces = np.arange(len(vertices), dtype=np.int64).reshape(-1, 3)
+    pts = vtk.vtkPoints()
+    pts.SetData(numpy_to_vtk(np.ascontiguousarray(vertices), deep=True))
     offsets = numpy_to_vtkIdTypeArray(
         np.arange(0, 3 * len(faces) + 1, 3, dtype=np.int64), deep=True
     )
@@ -54,9 +60,9 @@ def _polydata(mesh: trimesh.Trimesh, face_colors: NDArray[np.uint8] | None) -> v
     poly.SetPoints(pts)
     poly.SetPolys(cells)
     if face_colors is not None:
-        arr = numpy_to_vtk(np.ascontiguousarray(face_colors), deep=True)
+        arr = numpy_to_vtk(np.ascontiguousarray(np.repeat(face_colors, 3, axis=0)), deep=True)
         arr.SetName("colors")
-        poly.GetCellData().SetScalars(arr)
+        poly.GetPointData().SetScalars(arr)
     return poly
 
 
@@ -96,7 +102,7 @@ def render(
         mapper.SetInputData(_polydata(item.mesh, item.face_colors))
         if item.face_colors is not None:
             mapper.SetColorModeToDirectScalars()
-            mapper.SetScalarModeToUseCellData()
+            mapper.SetScalarModeToUsePointData()
         else:
             mapper.ScalarVisibilityOff()
         actor = vtk.vtkActor()

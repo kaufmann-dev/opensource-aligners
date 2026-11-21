@@ -9,8 +9,8 @@ import numpy as np
 import trimesh
 from numpy.typing import NDArray
 from scipy import ndimage, sparse
-from scipy.interpolate import make_smoothing_spline, splev, splprep
-from scipy.optimize import brentq
+from scipy.interpolate import splev, splprep
+from scipy.optimize import brentq, least_squares
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import KDTree
 
@@ -26,9 +26,15 @@ CR_ROOT_FRACTION = 0.4
 GUM_RES_MM = 0.1
 GUM_SOCKET_DROP_MM = 1.0
 CONTACT_HEIGHT_FRACTION = 0.4  # contacts are searched in the top 60 % of the crown
-ARCH_SMOOTHING = 1e-2  # smoothing-spline penalty of the ideal arch r(theta)
-ARCH_ROBUST_SCALE_MM = 2.5  # residual scale for down-weighting grossly displaced teeth
-ARCH_INSIDE_WEIGHT = 0.1  # weight of points inside the arch (the arch hugs the outer teeth)
+ARCH_KNOTS_MM = np.array([0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 36.0, 44.0, 54.0])
+ARCH_LENGTH_MM = 80.0  # half-arch length built from the midline (beyond every tooth)
+ARCH_STEP_MM = 0.25
+ARCH_CURVATURE_PENALTY = 30.0  # mm of fit residual per 1/mm of curvature second difference
+ARCH_SLOPE_PENALTY = 3.0  # ... per 1/mm of curvature first difference
+ARCH_BEND_PENALTY = 100.0  # ... per 1/mm of per-side bend
+ARCH_ANCHOR_WEIGHT = 10.0
+ARCH_IRLS_PASSES = 4
+ARCH_ROBUST_SCALE_MM = 1.0  # residual scale for down-weighting displaced teeth (Tukey)
 
 
 class ArchCurve:
@@ -188,7 +194,8 @@ def close_crown(patch: trimesh.Trimesh, axis: Array, stub: bool = True) -> trime
     tapered stub (for fabrication, so a moved crown never exposes a gap above the gingiva)."""
     V = np.asarray(patch.vertices)
     F = np.asarray(patch.faces, dtype=np.int64)
-    loops = boundary_loops(F)
+    # loops of fewer than three vertices come from pinch vertices of the patch: nothing to cap
+    loops = [loop for loop in boundary_loops(F) if len(loop) >= 3]
     if not loops:
         return patch
     verts = [V]
@@ -245,92 +252,135 @@ def _smoothstep(t: Array) -> Array:
 
 @dataclass
 class ArchForm:
-    """Ideal arch as a smooth polar curve r(theta) around a point inside the arch.
+    """Ideal arch: symmetric about x = 0 and built from a smooth curvature profile along its arc
+    length, so it can neither wiggle between teeth nor kink. Behind the canines each side may
+    bend a little more or less (`bend`) to meet its held back teeth. `delta` moves the arch
+    outward along its normal, fully at the front and fading to nothing at the held teeth."""
 
-    theta = 0 points anteriorly (+y), positive toward +x. The base form is symmetric and
-    smooth, fitted as an outer envelope of the teeth (lingually displaced teeth are brought
-    out to it); toward the held back teeth it blends into each side's actual position
-    (`side_offset`). Beyond the last teeth the radius is held constant."""
+    y0: float  # arch front at x = 0
+    kappa: Array  # curvature (1/mm) at ARCH_KNOTS_MM, constant beyond the last knot
+    bend: dict[int, float]  # +1 / -1 side of x: extra curvature behind the canines (1/mm)
+    s_blend: float  # arc length where the bend starts (canines)
+    s_anchor: float  # arc length of the held teeth (0 if none)
 
-    center_y: float
-    base: Any  # r(theta): symmetric smoothing spline
-    theta_blend: float  # |theta| where blending toward the held teeth starts
-    theta_anchor: float  # |theta| of the held teeth (0 if none)
-    side_offset: dict[int, float]  # +1 / -1 side of theta: radial correction at the held teeth
-    theta_max: float
-
-    def radius(self, theta: Array, delta: float = 0.0) -> Array:
-        r = self.base(np.clip(theta, -self.theta_max, self.theta_max))
-        if self.theta_anchor > self.theta_blend:
-            beta = _smoothstep(
-                (np.abs(theta) - self.theta_blend) / (self.theta_anchor - self.theta_blend)
+    def half(self, side: int) -> tuple[Array, Array]:
+        """Arc lengths and points of one half-arch, mirrored to x >= 0."""
+        s = np.arange(0.0, ARCH_LENGTH_MM + ARCH_STEP_MM, ARCH_STEP_MM)
+        k = np.interp(s, ARCH_KNOTS_MM, self.kappa)
+        if self.s_anchor > self.s_blend:
+            k = k + self.bend.get(side, 0.0) * _smoothstep(
+                (s - self.s_blend) / (self.s_anchor - self.s_blend)
             )
-            r = r + beta * np.where(
-                theta >= 0, self.side_offset.get(1, 0.0), self.side_offset.get(-1, 0.0)
-            )
-            fade = 1.0 - _smoothstep(np.abs(theta) / self.theta_anchor)
-        else:
-            fade = np.ones_like(theta)
-        return r + delta * fade
+        theta = np.r_[0.0, np.cumsum(0.5 * (k[1:] + k[:-1]) * ARCH_STEP_MM)]
+        dx, dy = np.cos(theta), -np.sin(theta)
+        x = np.r_[0.0, np.cumsum(0.5 * (dx[1:] + dx[:-1]) * ARCH_STEP_MM)]
+        y = self.y0 + np.r_[0.0, np.cumsum(0.5 * (dy[1:] + dy[:-1]) * ARCH_STEP_MM)]
+        return s, np.stack([x, y], axis=1)
 
     def curve(self, delta: float = 0.0) -> ArchCurve:
-        theta = np.linspace(-self.theta_max - 0.2, self.theta_max + 0.2, 1500)
-        r = self.radius(theta, delta)
-        pts = np.stack([r * np.sin(theta), self.center_y + r * np.cos(theta)], axis=1)
-        return ArchCurve(pts, smoothing_mm=0.005)
+        halves = []
+        for side in (-1, 1):
+            s, p = self.half(side)
+            if delta:
+                t = np.gradient(p, axis=0)
+                normal = np.stack([-t[:, 1], t[:, 0]], axis=1)  # outward on the x >= 0 half
+                normal /= np.linalg.norm(normal, axis=1)[:, None]
+                fade = 1.0 - _smoothstep(s / self.s_anchor) if self.s_anchor > 0 else 1.0
+                p = p + delta * np.reshape(fade, (-1, 1)) * normal
+            p = p * [side, 1.0]
+            halves.append(p[::-1] if side == -1 else p[1:])
+        return ArchCurve(np.vstack(halves), smoothing_mm=0.005)
+
+
+def _project_half(points: Array, half: Array) -> tuple[Array, Array]:
+    """Arc index position and signed distance (+ outside the arch) of x >= 0 points to a
+    half-arch polyline that starts at the midline."""
+    seg = np.diff(half, axis=0)
+    rel = points[:, None, :] - half[None, :-1, :]
+    t = np.clip((rel * seg).sum(-1) / (seg**2).sum(-1), 0.0, 1.0)
+    foot = half[None, :-1, :] + t[..., None] * seg
+    j = np.argmin(((points[:, None, :] - foot) ** 2).sum(-1), axis=1)
+    rows = np.arange(len(points))
+    normal = np.stack([-seg[j, 1], seg[j, 0]], axis=1)  # left of travel = outward
+    normal /= np.linalg.norm(normal, axis=1)[:, None]
+    return j + t[rows, j], ((points - foot[rows, j]) * normal).sum(-1)
 
 
 def fit_arch_form(
-    points: Array, weights: Array, anchor_points: dict[int, Array], blend_points: Array
+    points: Array,
+    weights: Array,
+    front_y: float,
+    anchor_points: dict[int, Array],
+    blend_points: Array,
 ) -> ArchForm:
-    """Fit an ArchForm to xy points: a symmetric penalized smoothing spline r(|theta|) with
-    robust reweighting, so displaced or rotated teeth do not bend the ideal arch.
-    `anchor_points` (+1/-1 side of x) are held-tooth contacts the curve must meet;
-    `blend_points` (e.g. the canines) mark where blending toward them starts."""
-    center_y = float(np.mean(points[:, 1]))
+    """Fit an ArchForm through `front_y` (the arch front at x = 0, i.e. the current incisors,
+    so that incisor advancement is measured from where they are) to xy contact points by
+    robust orthogonal least squares: Tukey weights drop displaced teeth, so they are brought
+    onto the arch of the others. `anchor_points` (+1/-1 side of x) are held-tooth contacts the
+    arch must meet; `blend_points` (the canines) mark where each side may start bending
+    toward them."""
+    side = np.where(points[:, 0] >= 0, 1, -1)
+    half_pts = np.stack([np.abs(points[:, 0]), points[:, 1]], axis=1)
+    anchors = {sd: np.array([abs(p[0]), p[1]]) for sd, p in anchor_points.items()}
+    nk = len(ARCH_KNOTS_MM)
+    robust = np.ones(len(points))
 
-    def polar(p: Array) -> tuple[Array, Array]:
-        return np.arctan2(p[:, 0], p[:, 1] - center_y), np.hypot(p[:, 0], p[:, 1] - center_y)
+    def build(v: Array, s_blend: float = 0.0, s_anchor: float = 0.0) -> ArchForm:
+        bend = {1: float(v[nk]), -1: float(v[nk + 1])} if len(v) > nk else {}
+        return ArchForm(front_y, np.asarray(v[:nk]), bend, s_blend, s_anchor)
 
-    theta, r = polar(points)
-    th = np.r_[theta, -theta]
-    rr = np.r_[r, r]
-    ww = np.r_[weights, weights]
-    order = np.argsort(th)
-    th, rr, ww = th[order], rr[order], ww[order]
-    keep = np.r_[True, np.diff(th) > 1e-4]
-    th, rr, ww = th[keep], rr[keep], ww[keep]
-    # Outer envelope: points inside the curve (lingually displaced teeth) get little weight, so
-    # the arch follows the outermost teeth and crowding is resolved by bringing teeth out, not
-    # by pulling well-positioned ones in. Tukey weights still drop gross outliers.
-    spline = make_smoothing_spline(th, rr, w=ww, lam=ARCH_SMOOTHING)
-    for _ in range(6):
-        res = rr - spline(th)
-        robust = np.clip(1 - (res / (4.685 * ARCH_ROBUST_SCALE_MM)) ** 2, 0, 1) ** 2 + 1e-3
-        robust = np.where(res < 0, robust * ARCH_INSIDE_WEIGHT, robust)
-        spline = make_smoothing_spline(th, rr, w=ww * robust, lam=ARCH_SMOOTHING)
-    form = ArchForm(center_y, spline, 0.0, 0.0, {}, float(np.abs(theta).max()))
-    anchors = {side: pts for side, pts in anchor_points.items() if len(pts)}
-    if anchors:
-        th_anchor = float(np.mean([np.abs(polar(pts)[0]).mean() for pts in anchors.values()]))
-        th_blend = (
-            float(np.abs(polar(blend_points)[0]).mean()) if len(blend_points) else 0.5 * th_anchor
-        )
-        offsets = {}
-        for side, pts in anchors.items():
-            t_a, r_a = polar(pts)
-            offsets[side] = float(np.mean(r_a - form.radius(t_a)))
-        form = ArchForm(
-            center_y, spline, min(th_blend, 0.9 * th_anchor), th_anchor, offsets, form.theta_max
-        )
-    return form
+    def distances(f: ArchForm) -> Array:
+        res = np.empty(len(points))
+        for sd in (1, -1):
+            if (side == sd).any():
+                res[side == sd] = _project_half(half_pts[side == sd], f.half(sd)[1])[1]
+        return res
+
+    def fit(v: Array, *spans: float) -> Array:
+        nonlocal robust
+
+        def residuals(u: Array) -> Array:
+            f = build(u, *spans)
+            out = [np.sqrt(weights * robust) * distances(f)]
+            for sd, p in anchors.items() if len(u) > nk else ():
+                out.append(ARCH_ANCHOR_WEIGHT * _project_half(p[None], f.half(sd)[1])[1])
+            k = u[:nk]
+            out += [ARCH_CURVATURE_PENALTY * np.diff(k, 2), ARCH_SLOPE_PENALTY * np.diff(k)]
+            out.append(ARCH_BEND_PENALTY * u[nk:])
+            return np.concatenate(out)
+
+        # curvature >= 0: an arch never turns concave (outward) at its front
+        bounds = (np.r_[np.zeros(nk), np.full(len(v) - nk, -np.inf)], np.full(len(v), np.inf))
+        v = np.clip(v, bounds[0], None)
+        for _ in range(ARCH_IRLS_PASSES):
+            v = least_squares(residuals, v, bounds=bounds).x
+            res = distances(build(v, *spans))
+            robust = np.clip(1 - (res / (4.685 * ARCH_ROBUST_SCALE_MM)) ** 2, 0, 1) ** 2 + 1e-3
+        return v
+
+    v = fit(np.interp(ARCH_KNOTS_MM, [0.0, 20.0, 40.0], [0.05, 0.05, 0.0]))
+    if not anchors:
+        return build(v)
+    symmetric = build(v)
+
+    def arc(p: Array) -> float:
+        sd = 1 if p[0] >= 0 else -1
+        q = np.array([[abs(p[0]), p[1]]])
+        return float(_project_half(q, symmetric.half(sd)[1])[0][0] * ARCH_STEP_MM)
+
+    s_anchor = float(np.mean([arc(p) for p in anchor_points.values()]))
+    blend = [arc(p) for p in blend_points]
+    s_blend = min(float(np.mean(blend)) if blend else 0.5 * s_anchor, 0.8 * s_anchor)
+    v = fit(np.r_[v, 0.0, 0.0], s_blend, s_anchor)
+    return build(v, s_blend, s_anchor)
 
 
 def ideal_arch_form(
     teeth: dict[int, "Tooth"], widen: dict[int, float] | None = None, held: set[int] | None = None
 ) -> ArchForm:
-    """Ideal arch through the teeth's contact points: symmetric, smooth, meeting the held teeth
-    (default: first and second molars). `widen` adds per-position transverse offsets."""
+    """Ideal arch through the teeth's contact points: symmetric, smooth, through the current
+    central incisors, meeting the held teeth (default: first and second molars). `widen` adds
+    per-position transverse offsets."""
     widen = widen or {}
     held = held if held is not None else {n for n in teeth if fdi.position(n) >= 6}
     pts, wts = [], []
@@ -349,11 +399,11 @@ def ideal_arch_form(
             anchor[side].append(p)
         if fdi.position(n) == 3:
             canines.append(t.distal_contact[:2])
-    front = {side: np.array(v) for side, v in anchor.items() if v}
-    # use the most mesial held contact per side
-    for side, v in front.items():
-        front[side] = v[np.argmax(v[:, 1])][None]
-    return fit_arch_form(np.array(pts), np.array(wts), front, np.array(canines))
+    # the most mesial held contact per side
+    front = {side: max(v, key=lambda p: p[1]) for side, v in anchor.items() if v}
+    centrals = [t.mesial_contact[1] for n, t in teeth.items() if fdi.position(n) == 1]
+    front_y = float(np.mean(centrals)) if centrals else float(np.max(np.array(pts)[:, 1]))
+    return fit_arch_form(np.array(pts), np.array(wts), front_y, front, np.array(canines))
 
 
 def fit_arch(points: dict[int, Array]) -> ArchCurve:
@@ -373,9 +423,9 @@ def build_tooth(
 ) -> tuple[Tooth, trimesh.Trimesh]:
     """Frame and landmarks of one tooth, all intrinsic to the tooth.
 
-    The mesiodistal axis m of incisors is their incisal edge; of canines, perpendicular to the
-    labial surface; of premolars and molars it runs between the contacts with the neighbors
-    (`contacts`), or along the arch at the arch ends. Contact points and width come from the
+    The mesiodistal axis m of incisors is their incisal edge; of canines, premolars and molars
+    it runs between the contacts with the neighbors (`contacts`), or along the arch at the arch
+    ends. (A canine's convex labial surface gives no reliable direction.) Contact points and width come from the
     crown's own mesial and distal extremes along m, so overlapping (crowded) neighbors do not
     distort them."""
     V = np.asarray(patch.vertices)
@@ -388,9 +438,6 @@ def build_tooth(
     pos = fdi.position(number)
     if pos <= 2:
         m = incisal_axis(V, o)
-    elif pos == 3:
-        # canines are near-round in occlusal view: perpendicular to the labial surface
-        m = np.cross(o, facial_normal(solid, len(patch.faces), o, curve.outward(s_here)))
     elif "mesial" in contacts and "distal" in contacts:
         m = contacts["mesial"] - contacts["distal"]
     else:
@@ -483,34 +530,6 @@ def incisal_edge(vertices: Array, m: Array, o: Array) -> Array:
     slope = float(np.polyfit(xs, crest, 1)[0]) if len(xs) >= 2 else 0.0
     e = m + slope * o
     return e / np.linalg.norm(e)
-
-
-def facial_normal(solid: trimesh.Trimesh, n_patch_faces: int, o: Array, outward: Array) -> Array:
-    """Mean outward normal of the facial (buccal/labial) crown surface, perpendicular to o.
-
-    Starts from the arch's outward direction and re-centers on the facial faces a few times,
-    so a rotated tooth converges to its own facial direction. `solid` must be the closed
-    crown (consistent outward normals) whose first faces are the scanned patch."""
-    normals = np.asarray(solid.face_normals)[:n_patch_faces]
-    centers = np.asarray(solid.triangles_center)[:n_patch_faces]
-    area = np.asarray(solid.area_faces)[:n_patch_faces]
-    h = centers @ o
-    lo, hi = np.quantile(h, 0.1), h.max()
-    band = (h > lo + 0.25 * (hi - lo)) & (h < lo + 0.8 * (hi - lo))
-    flat = normals - np.outer(normals @ o, o)
-    b = outward - np.dot(outward, o) * o
-    b /= np.linalg.norm(b)
-    for _ in range(12):
-        sel = band & (flat @ b > np.cos(np.radians(55)) * np.linalg.norm(flat, axis=1))
-        if sel.sum() < 10:
-            break
-        new = (flat[sel] * area[sel, None]).sum(axis=0)
-        new /= np.linalg.norm(new)
-        if np.dot(new, b) > 0.99999:
-            b = new
-            break
-        b = new
-    return b
 
 
 def _toward_midline(tooth: int, neighbor: int) -> bool:

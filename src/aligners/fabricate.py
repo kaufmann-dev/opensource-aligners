@@ -12,7 +12,7 @@ from scipy import ndimage
 from aligners import fdi
 from aligners.analyze import posed_teeth
 from aligners.anatomy import JawAnatomy, Tooth
-from aligners.case import Case, CaseError, read_json, read_mesh, write_json
+from aligners.case import Case, CaseError, read_json, write_json
 from aligners.fdi import JAWS, Jaw
 from aligners.fields import (
     Dentition,
@@ -245,13 +245,9 @@ def _task(args: tuple[str, str, int, str]) -> dict[str, Any]:
 
 def export_surgery(case: Case, report: dict[str, Any]) -> list[str]:
     """out/surgery/: movement table (plan.toml format), full report, landmarks for other
-    planning software, and bone/teeth STLs in DICOM patient (LPS) coordinates."""
-    from aligners.surgery import (
-        landmarks_document,
-        movements_toml,
-        posed_tooth_meshes,
-        segment_poses,
-    )
+    planning software, and the planned teeth of both jaws before and after surgery as STLs in
+    DICOM patient (LPS) coordinates of the CT."""
+    from aligners.surgery import landmarks_document, movements_toml, posed_tooth_meshes
 
     out = case.out / "surgery"
     if out.exists():
@@ -261,37 +257,19 @@ def export_surgery(case: Case, report: dict[str, Any]) -> list[str]:
     (out / "movements.toml").write_text(movements_toml(report))
     write_json(out / "movements.json", report)
     write_json(out / "landmarks.json", landmarks_document(report))
-    head_to_ct = np.linalg.inv(np.asarray(report["ct_to_head"], float))
-    names = {
-        "maxilla": ("maxilla_pre", "maxilla_post"),
-        "mandible_distal": ("mandible_distal_pre", "mandible_distal_post"),
-        "proximal_right": ("proximal_right_pre", "proximal_right_post"),
-        "proximal_left": ("proximal_left_pre", "proximal_left_post"),
-        "cranium": ("cranium", None),
-    }
     files = ["movements.toml", "movements.json", "landmarks.json"]
-    for seg, (pre, post) in segment_poses(report).items():
-        path = case.work / "surgery" / f"{seg}.ply"
-        if not path.exists():
-            continue
-        mesh = read_mesh(path)
-        for name, T in zip(names[seg], (pre, post), strict=True):
-            if name is None or (name.endswith("_post") and np.allclose(T, pre)):
-                continue
-            moved = trimesh.Trimesh(
-                transform_points(head_to_ct @ T, np.asarray(mesh.vertices)), mesh.faces
-            )
-            moved.export(out / f"{name}.stl")
-            files.append(f"{name}.stl")
+    frame_to_ct = np.linalg.inv(np.asarray(report["ct_to_frame"]["upper"], float))
     setup = read_json(case.work / "setup.json")
     for jaw in JAWS:
         anatomy = JawAnatomy.load(case.anatomy_dir(jaw), jaw)
         poses = {
             int(n): np.asarray(t["pose"], float) for n, t in setup["jaws"][jaw]["teeth"].items()
         }
-        Q = np.asarray(report["arch_to_head"]["after_surgery"][jaw], float)
-        posed_tooth_meshes(anatomy, poses, head_to_ct @ Q).export(out / f"{jaw}_teeth_post.stl")
-        files.append(f"{jaw}_teeth_post.stl")
+        for when in ("before_surgery", "after_surgery"):
+            P = np.asarray(report["arch_to_frame"][when][jaw], float)
+            name = f"{jaw}_teeth_{when}.stl"
+            posed_tooth_meshes(anatomy, poses, frame_to_ct @ P).export(out / name)
+            files.append(name)
     return [f"surgery/{f}" for f in files]
 
 

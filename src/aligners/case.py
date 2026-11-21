@@ -50,7 +50,7 @@ CASE_TEMPLATE = """\
 [inputs]              # required: both scans and a CT (or its TotalSegmentator labelmap)
 upper = {upper}     # upper jaw intraoral scan (STL/PLY/OBJ)
 lower = {lower}     # lower jaw intraoral scan; export both scans in occlusion for the best bite
-ct = {ct}        # DICOM directory or CT NIfTI; needed for surgical modes even when ct_seg is given
+ct = {ct}        # DICOM directory or CT NIfTI; not needed when ct_seg is given
 ct_seg = {ct_seg}    # existing TotalSegmentator `teeth` multilabel NIfTI, "" to compute it
 series = {series}    # DICOM SeriesInstanceUID or SeriesNumber override, "" = automatic
 
@@ -87,7 +87,7 @@ PLAN_DEFAULTS: dict[str, Any] = {
         "tipping": True,
         "tipping_pivot": 0.7,
         "harmonize_inclination": True,
-        "level_incisal_edges": True,
+        "harmonize_incisal_edges": True,
         "level": True,
         "spee_flatten": 0.0,
         "close_spaces": True,
@@ -115,14 +115,11 @@ PLAN_DEFAULTS: dict[str, Any] = {
     "attachments": {"auto": True, "add": [], "remove": []},
     "surgery": {
         "mode": "none",
-        "head_pitch_deg": 0.0,
+        "pitch_deg": 0.0,
         "auto": {
-            "osteotomies": ["lefort1", "bsso"],
-            "maxilla_forward_mm": 0.0,
-            "maxilla_up_mm": 0.0,
-            "maxilla_pitch_deg": 0.0,
-            "upper_incisor_deg": 110.0,
-            "lower_incisor_deg": 93.0,
+            "move": "mandible",
+            "upper_incisor_deg": 30.0,
+            "lower_incisor_deg": 15.0,
         },
         "maxilla": {},
         "mandible": {},
@@ -130,7 +127,7 @@ PLAN_DEFAULTS: dict[str, Any] = {
 }
 
 SURGERY_MODES = ("none", "auto", "manual")
-OSTEOTOMIES = ("lefort1", "bsso")
+MOVED_JAWS = ("mandible", "maxilla")
 LANDMARKS = ("incisor_midline", "canine_right", "canine_left", "molar_right", "molar_left")
 LANDMARK_MOVE_KEYS = {"forward_mm": 0.0, "up_mm": 0.0, "left_mm": 0.0}
 
@@ -154,7 +151,7 @@ derotate = true           # turn each tooth so its mesiodistal axis follows the 
 tipping = true            # move crowns outward/inward by tipping (changes inclination), not bodily
 tipping_pivot = 0.7       # tipping center: fraction of the root length below the gingival margin
 harmonize_inclination = true  # give left/right homologous teeth the same outward/inward inclination
-level_incisal_edges = true    # tip incisors so their incisal edges are horizontal (straight smile line)
+harmonize_incisal_edges = true  # tip incisors so left and right incisal edges mirror each other
 level = true              # bring cusp tips / incisal edges onto a smooth occlusal curve
 spee_flatten = 0.0        # 0 = keep curve of Spee depth, 1 = flatten it completely
 close_spaces = true       # close spacing by retracting incisors (within max_incisor_retract_mm)
@@ -176,7 +173,7 @@ enforce = false           # true = also correct overjet/overbite to the targets 
 overjet_mm = 2.5
 overbite_mm = 2.0
 overbite_split = 0.5      # share of overbite correction done by upper incisors
-align_midlines = true     # move the upper dental midline onto the lower one
+align_midlines = true     # bring the dental midlines together, each arch moving half
 
 # Per-tooth overrides in the tooth's own frame, pivoting about its center of resistance.
 # Applied on top of the solved target. Signs: mesial + toward midline, buccal + labial,
@@ -191,33 +188,31 @@ auto = true               # add attachments where movements need grip
 add = []                  # e.g. ["13", "23"]
 remove = []
 
-[surgery]                 # orthognathic surgery after the last aligner stage (orthodontics first)
+[surgery]                 # jaw surgery after the last aligner stage (orthodontics first)
 mode = "none"             # "none" = orthodontics only: teeth fit the current jaws
-                          # "auto" = solve Le Fort I / BSSO moves for an ideal occlusion and a symmetric face
+                          # "auto" = align each arch on its own jaw, then move one jaw so the teeth fit ideally
                           # "manual" = jaws move as in [surgery.maxilla] / [surgery.mandible]; teeth fit that
-head_pitch_deg = 0.0      # head-frame horizontal vs the CT axes, + = anterior up; set it so `analyze`
-                          # face.maxilla.occlusal_pitch_deg matches the surgeon's planning software
+pitch_deg = 0.0           # movement-frame horizontal vs the upper occlusal plane, + = anterior up
+                          # (e.g. to report in the frame of a surgeon's planning software)
 
-# Auto mode sets up each arch on its own jaw (decompensation), then places the mandible for an
-# ideal occlusion (Class I, bite.overjet_mm) and levels and centers the maxilla on the face.
+# Auto mode aligns each arch on its own jaw with the incisors at their target inclinations (no
+# compensation for the other jaw), then moves one jaw into the ideal occlusion: bite.overjet_mm,
+# coinciding midlines, Class I canines and molars, seated back teeth. It reports that movement.
 # bite.enforce, bite.min_overjet_mm and bite.align_midlines are not used in auto mode.
 [surgery.auto]
-osteotomies = ["lefort1", "bsso"]  # jaws the solver may move
-maxilla_forward_mm = 0.0  # sagittal maxilla position the solver keeps (at the upper incisor midline)
-maxilla_up_mm = 0.0       # + impaction, - downgraft
-maxilla_pitch_deg = 0.0   # + anterior up (counterclockwise in the right profile view)
-upper_incisor_deg = 110.0 # decompensation: upper incisor axis to the head horizontal (90 = upright)
-lower_incisor_deg = 93.0  # decompensation: lower incisor axis to the mandibular plane (IMPA)
+move = "mandible"         # the jaw that moves ("mandible" or "maxilla"); the other stays
+upper_incisor_deg = 30.0  # upper incisor axis vs the perpendicular to the occlusal plane, + = labial
+lower_incisor_deg = 15.0  # lower incisor axis vs the perpendicular to the occlusal plane, + = labial
 
 # Manual mode: landmark displacements from the surgical plan (e.g. the rows of a ProPlan CMF
-# point table), mm in the head frame: forward_mm + anterior, up_mm + superior, left_mm + toward
-# the patient's left. Landmarks: incisor_midline, canine_right, canine_left, molar_right,
+# point table), mm in the movement frame: forward_mm + anterior, up_mm + superior, left_mm +
+# toward the patient's left. Landmarks: incisor_midline, canine_right, canine_left, molar_right,
 # molar_left (mesiobuccal cusp of the first molar). One landmark = pure translation; otherwise
 # give at least three. Omitted keys are 0; an empty table leaves that jaw in place.
-[surgery.maxilla]         # Le Fort I
+[surgery.maxilla]
 # incisor_midline = { forward_mm = 4.0, up_mm = 0.0, left_mm = 0.0 }
 
-[surgery.mandible]        # BSSO distal segment (or autorotation, as the plan reports it)
+[surgery.mandible]
 """
 
 
@@ -247,11 +242,8 @@ def _validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     surgery = plan["surgery"]
     if surgery["mode"] not in SURGERY_MODES:
         raise CaseError(f"surgery.mode must be one of {', '.join(SURGERY_MODES)}")
-    cuts = surgery["auto"]["osteotomies"]
-    if not isinstance(cuts, list) or not set(cuts) <= set(OSTEOTOMIES):
-        raise CaseError(f"surgery.auto.osteotomies must list {' and/or '.join(OSTEOTOMIES)}")
-    if surgery["mode"] == "auto" and not cuts:
-        raise CaseError("surgery.auto.osteotomies is empty: nothing for auto mode to move")
+    if surgery["auto"]["move"] not in MOVED_JAWS:
+        raise CaseError(f"surgery.auto.move must be one of {', '.join(MOVED_JAWS)}")
     for jaw in ("maxilla", "mandible"):
         table: dict[str, Any] = {}
         for name, move in surgery[jaw].items():
