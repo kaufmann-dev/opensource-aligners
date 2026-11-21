@@ -135,10 +135,12 @@ def relabel_cmd(
 @app.command("render")
 def render_cmd(
     case: CaseArg,
-    what: Annotated[str, typer.Option(help="segmentation | setup | stage:N | bite")],
+    what: Annotated[
+        str, typer.Option(help="segmentation | setup | stage:N | bite | bite:final | surgery")
+    ],
     as_json: JsonOpt = False,
 ) -> None:
-    """Render PNGs (occlusal, frontal, right, left) into work/renders/."""
+    """Render PNGs (occlusal, frontal, right, left; surgery: head frame) into work/renders/."""
     from aligners.views import render_what
 
     _run(
@@ -178,14 +180,39 @@ def setup(case: CaseArg, as_json: JsonOpt = False) -> None:
     def fn() -> dict[str, Any]:
         result = run_setup(Case(case))
         result["renders"] = render_what(Case(case), "setup")["files"]
+        if "surgery" in result:
+            result["renders"] += render_what(Case(case), "surgery")["files"]
         return result
 
     def summary(r: dict[str, Any]) -> None:
         for jaw, j in r["jaws"].items():
             ipr = ", ".join(f"{k}: {v:.2f}" for k, v in j["ipr_mm"].items()) or "none"
             console.print(f"{jaw}: incisors {j['incisor_change_mm']:+.1f} mm, IPR {ipr}")
+        if "surgery" in r:
+            _surgery_summary(r["surgery"])
 
     _run(as_json, fn, summary)
+
+
+def _surgery_summary(s: dict[str, Any]) -> None:
+    console.print(f"surgery ({s['mode']}), mm forward / up / left at the scanned landmarks:")
+    for bone, table in s["movements"].items():
+        for name, m in table.items():
+            console.print(
+                f"  {bone:8} {name:15} {m['forward_mm']:+5.1f} {m['up_mm']:+5.1f} "
+                f"{m['left_mm']:+5.1f}"
+            )
+        a = s["angles"][bone]
+        change = ", ".join(
+            f"{k.removesuffix('_deg').removesuffix('_mm')} {a['before_surgery'][k]:+.1f}"
+            f" -> {v:+.1f}"
+            for k, v in a["after_surgery"].items()
+            if k in ("cant_deg", "yaw_deg", "occlusal_pitch_deg", "midline_mm")
+        )
+        console.print(f"  {bone:8} {change}")
+    if s["split_gap_mm"]:
+        gaps = ", ".join(f"{k} {v:+.1f}" for k, v in s["split_gap_mm"].items())
+        console.print(f"  split gap (+) / overlap (-) mm: {gaps}")
 
 
 @app.command()
@@ -282,6 +309,8 @@ def run(
         steps["analyze"] = run_analyze(c)
         steps["setup"] = run_setup(c)
         render_what(c, "setup")
+        if "surgery" in steps["setup"]:
+            render_what(c, "surgery")
         render_what(c, "bite")
         render_what(c, "bite:final")
         stage_result = run_stage(c)

@@ -167,6 +167,42 @@ def arch_to_bite(case: Case) -> dict[Jaw, Array] | None:
     return {jaw: np.asarray(jaws[jaw]["arch_to_bite"], float) for jaw in JAWS}
 
 
+def final_arch_to_bite(case: Case) -> dict[Jaw, Array]:
+    """Arch -> bite transforms of the planned result: after surgery in the surgical modes."""
+    setup = read_json(case.require(case.work / "setup.json", "setup"))
+    return {jaw: np.asarray(setup["arch_to_bite_final"][jaw], float) for jaw in JAWS}
+
+
+def analyze_face(case: Case, anatomies: dict[Jaw, JawAnatomy]) -> dict[str, Any]:
+    """Jaw positions against the facial midline and the head horizontal (pre-treatment)."""
+    from aligners.surgery import (
+        dental_landmarks,
+        head_frames,
+        incisor_angles,
+        jaw_angles,
+        mandible_landmarks,
+        to_head,
+    )
+
+    hf = head_frames(case, case.plan(), anatomies)
+    mand = mandible_landmarks(case, hf, anatomies["lower"])
+    out: dict[str, Any] = {
+        "maxilla": jaw_angles(to_head(hf.P["upper"], dental_landmarks(anatomies["upper"]))),
+        "mandible": jaw_angles(to_head(hf.P["lower"], dental_landmarks(anatomies["lower"]))),
+        "incisors": incisor_angles(anatomies, hf.P, mand),
+        "chin_mm": {k: float(-mand[k][0]) for k in ("pogonion", "menton") if k in mand},
+        "symmetry_rmse_mm": read_json(case.ct_dir / "skull.json")["symmetry_rmse_mm"],
+        "meaning": "head frame; midline/chin + = patient left, cant + = left side up, "
+        "pitch + = anterior up, yaw + = incisors toward patient left",
+    }
+    for side in ("right", "left"):
+        if f"condylion_{side}" in mand and f"gonion_{side}" in mand:
+            out.setdefault("ramus_height_mm", {})[side] = float(
+                np.linalg.norm(mand[f"condylion_{side}"] - mand[f"gonion_{side}"])
+            )
+    return out
+
+
 def analyze_bite(
     upper: JawAnatomy,
     lower: JawAnatomy,
@@ -255,5 +291,7 @@ def run_analyze(case: Case) -> dict[str, Any]:
     else:
         result["bite"] = None
         result["warnings"].append("bite unavailable: no CT and scans are not bite-registered")
+    if (case.ct_dir / "skull.json").exists() and to_bite:
+        result["face"] = analyze_face(case, anatomies)
     write_json(case.work / "analysis.json", result)
     return result

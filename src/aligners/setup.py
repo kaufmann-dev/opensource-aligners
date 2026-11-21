@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 from scipy.optimize import brentq
@@ -21,6 +21,11 @@ from aligners.geometry import (
 )
 from aligners.motion import Movement, compose, decompose
 from aligners.scan import patient_right_sign
+
+if TYPE_CHECKING:
+    from aligners.surgery import HeadFrames
+
+BONE = {"upper": "maxilla", "lower": "mandible"}
 
 ANCHOR_WEIGHT = 10.0  # leveling fit weight of held teeth
 IPR_COST = 0.5  # per mm of enamel reduction
@@ -46,6 +51,7 @@ class Adjust:
     midline_x: float | None = None  # fixed midline x in this arch frame
     anterior_dz: float = 0.0  # vertical incisor change along arch z (+ = occlusal)
     tooth_dz: dict[int, float] = field(default_factory=dict)  # per-tooth vertical correction
+    reason: str = "bite goal"  # what asks for `delta` (warning text)
 
 
 @dataclass
@@ -93,9 +99,12 @@ class JawSolver:
         goals: dict[str, Any],
         overrides: dict[str, Any],
         vertical: Array | None = None,
+        incisor_axes: dict[int, Array] | None = None,
     ):
         """`vertical`: the shared frontal-view vertical in this arch frame (the lower arch's
-        occlusal normal), against which incisal edges are leveled in both arches."""
+        occlusal normal, or the head's vertical after surgery), against which incisal edges are
+        leveled in both arches. `incisor_axes`: decompensated crownward long axes (arch frame)
+        the incisors are torqued to, whatever `harmonize_inclination` says."""
         self.a = anatomy
         self.vertical = np.array([0.0, 0.0, 1.0]) if vertical is None else vertical
         self.jaw = anatomy.jaw
@@ -119,6 +128,15 @@ class JawSolver:
         self._space_samples: dict[tuple[float, float], list[dict[int, float]]] = {}
         self._anchor_poses: dict[int, Array] = {}
         self.inclination_target = self._inclination_targets()
+        self.decompensate: set[int] = set()
+        if incisor_axes:
+            curve = self.base_form().curve()
+            for n, axis in incisor_axes.items():
+                if n not in self.teeth or n in self.fixed:
+                    continue
+                out = curve.outward(float(curve.project(self.mid(self.teeth[n])[:2])[0]))
+                self.inclination_target[n] = float(np.arctan2(axis @ out, axis[2]))
+                self.decompensate.add(n)
         self.edges = {
             n: incisal_edge(np.asarray(anatomy.patches[n].vertices), t.m, t.o)
             for n, t in self.teeth.items()
@@ -168,6 +186,21 @@ class JawSolver:
             if other in incl:
                 targets[n] = 0.5 * (incl[n] + incl[other])
         return targets
+
+    def decompensation_delta(self) -> float:
+        """Incisor advancement (mm) that puts the arch through the incisors once they are
+        torqued about their CR to the decompensated inclinations (as `_place` does)."""
+        curve = self.base_form().curve(0.0)
+        moves = []
+        for n in sorted(self.decompensate - self.anchors):
+            t = self.teeth[n]
+            p = self.mid(t)
+            out = curve.outward(float(curve.project(p[:2])[0]))
+            across = np.cross([0.0, 0.0, 1.0], out)
+            now = float(np.arctan2(t.o @ out, t.o[2]))
+            R = rotation_about(across, self.inclination_target[n] - now, t.cr)
+            moves.append(float((transform_points(R, p[None])[0] - p) @ out))
+        return float(np.mean(moves)) if moves else 0.0
 
     def base_form(self) -> ArchForm:
         """Ideal arch through the contacts, with expansion, meeting the held teeth."""
@@ -297,7 +330,8 @@ class JawSolver:
             delta = float(np.clip(adjust.delta, -g["max_incisor_retract_mm"], hi))
             if abs(delta - adjust.delta) > 0.05:
                 warnings.append(
-                    f"bite goal needs {adjust.delta:+.1f} mm incisor change; limited to {delta:+.1f}"
+                    f"{adjust.reason} needs {adjust.delta:+.1f} mm incisor change; "
+                    f"limited to {delta:+.1f}"
                 )
         elif hi <= lo:
             delta = float(lo)
@@ -569,7 +603,11 @@ class JawSolver:
         s_mid = 0.5 * (s_mesial + s_distal)
         out = curve.outward(s_mid)
         across = np.cross([0.0, 0.0, 1.0], out)  # rotating +z about this moves it toward `out`
-        if g["harmonize_inclination"] and not anchor and t.fdi in self.inclination_target:
+        if (
+            (g["harmonize_inclination"] or t.fdi in self.decompensate)
+            and not anchor
+            and t.fdi in self.inclination_target
+        ):
             o_now = R[:3, :3] @ t.o
             now = float(np.arctan2(o_now @ out, o_now[2]))
             R = rotation_about(across, self.inclination_target[t.fdi] - now, t.cr) @ R
@@ -673,120 +711,126 @@ def _jaw_report(anatomy: JawAnatomy, setup: JawSetup) -> dict[str, Any]:
     }
 
 
-def run_setup(case: Case) -> dict[str, Any]:
-    plan = case.plan()
-    goals = plan["goals"]
-    for key in plan["teeth"]:
-        if not fdi.is_valid(int(key)):
-            raise CaseError(f'[teeth."{key}"] is not an FDI tooth number')
-    anatomies = {
-        jaw: JawAnatomy.load(case.require(case.anatomy_dir(jaw), "segment"), jaw)
-        for jaw in case.jaws()
-    }
-    to_bite = arch_to_bite(case)
-    if to_bite is None:
-        raise CaseError("frames.json has no bite; run `aligners segment` again")
-    up_to_low = (np.linalg.inv(to_bite["lower"]) @ to_bite["upper"])[:3, :3]
-    vertical = {"lower": np.array([0.0, 0.0, 1.0]), "upper": up_to_low.T @ [0.0, 0.0, 1.0]}
-    solvers = {
-        jaw: JawSolver(a, goals, plan["teeth"], vertical[jaw]) for jaw, a in anatomies.items()
-    }
-    setups = {jaw: s.solve() for jaw, s in solvers.items()}
-    result: dict[str, Any] = {"warnings": []}
-    bite = goals["bite"]
-    adjust_u, adjust_l = Adjust(), Adjust()
-    initial = analyze_bite(anatomies["upper"], anatomies["lower"], to_bite)
-    baseline = {(i["lower"], i["upper"]): i["depth_mm"] for i in initial["interferences"]}
+Setups = dict[Jaw, JawSetup]
 
-    def settle_bite() -> None:
-        for _ in range(BITE_ITERATIONS):
-            metrics = analyze_bite(
-                anatomies["upper"],
-                anatomies["lower"],
-                to_bite,
-                {j: s.poses for j, s in setups.items()},
-            )
-            if "overjet_mm" not in metrics:
-                break
-            changed = False
-            if bite["enforce"]:
-                err = metrics["overbite_mm"] - bite["overbite_mm"]
-                if abs(err) > 0.1:
-                    adjust_u.anterior_dz -= err * bite["overbite_split"]
-                    adjust_l.anterior_dz -= err * (1 - bite["overbite_split"])
-                    changed = True
-                if abs(bite["overjet_mm"] - metrics["overjet_mm"]) > 0.1:
-                    adjust_u.delta = (
-                        setups["upper"].delta + bite["overjet_mm"] - metrics["overjet_mm"]
-                    )
-                    changed = True
-            else:
-                if metrics["overjet_mm"] < bite["min_overjet_mm"] - 0.05:
-                    adjust_u.delta = (
-                        setups["upper"].delta + bite["min_overjet_mm"] - metrics["overjet_mm"]
-                    )
-                    changed = True
-                if metrics["overbite_mm"] < bite["min_overbite_mm"] - 0.05:
-                    err = metrics["overbite_mm"] - bite["min_overbite_mm"]
-                    adjust_u.anterior_dz -= err * bite["overbite_split"]
-                    adjust_l.anterior_dz -= err * (1 - bite["overbite_split"])
-                    changed = True
-            if (
-                bite["align_midlines"]
-                and abs(metrics.get("midline_upper_vs_lower_left_mm", 0.0)) > 0.05
-            ):
-                # + means the upper midline lies to the patient's left; the upper arch frame's +x
-                # points to the patient's left, so the upper segment moves by the negative amount
-                adjust_u.midline_x = (
-                    setups["upper"].midline_x - metrics["midline_upper_vs_lower_left_mm"]
+
+def settle_bite(
+    anatomies: dict[Jaw, JawAnatomy],
+    solvers: dict[Jaw, JawSolver],
+    setups: Setups,
+    adjust: dict[Jaw, Adjust],
+    to_bite: dict[Jaw, Array],
+    goals: dict[str, Any],
+    baseline: dict[tuple[int, int], float],
+    couple: bool = True,
+) -> None:
+    """Re-solve both arches until the bite goals hold. With `couple` the teeth also compensate
+    the jaw relation (overjet, overbite, midlines, upper front advance); without it (surgery
+    decides the jaw relation) only occlusal interferences and the minimum overbite are fixed."""
+    bite = goals["bite"]
+    adjust_u, adjust_l = adjust["upper"], adjust["lower"]
+    for _ in range(BITE_ITERATIONS):
+        metrics = analyze_bite(
+            anatomies["upper"],
+            anatomies["lower"],
+            to_bite,
+            {j: s.poses for j, s in setups.items()},
+        )
+        if "overjet_mm" not in metrics:
+            break
+        changed = False
+        if couple and bite["enforce"]:
+            err = metrics["overbite_mm"] - bite["overbite_mm"]
+            if abs(err) > 0.1:
+                adjust_u.anterior_dz -= err * bite["overbite_split"]
+                adjust_l.anterior_dz -= err * (1 - bite["overbite_split"])
+                changed = True
+            if abs(bite["overjet_mm"] - metrics["overjet_mm"]) > 0.1:
+                adjust_u.delta = setups["upper"].delta + bite["overjet_mm"] - metrics["overjet_mm"]
+                changed = True
+        else:
+            if couple and metrics["overjet_mm"] < bite["min_overjet_mm"] - 0.05:
+                adjust_u.delta = (
+                    setups["upper"].delta + bite["min_overjet_mm"] - metrics["overjet_mm"]
                 )
                 changed = True
-            # new occlusal interferences: intrude both teeth of the pair (and their left/right
-            # counterparts, so the arch stays symmetric) by half the excess each, within a cap
-            front_excess = 0.0
-            for hit in metrics["interferences"]:
-                excess = hit["depth_mm"] - baseline.get((hit["lower"], hit["upper"]), 0.0) - 0.05
-                if (
-                    excess > 0.05
-                    and fdi.position(hit["lower"]) <= 3
-                    and fdi.position(hit["upper"]) <= 3
+            if metrics["overbite_mm"] < bite["min_overbite_mm"] - 0.05:
+                err = metrics["overbite_mm"] - bite["min_overbite_mm"]
+                adjust_u.anterior_dz -= err * bite["overbite_split"]
+                adjust_l.anterior_dz -= err * (1 - bite["overbite_split"])
+                changed = True
+        if (
+            couple
+            and bite["align_midlines"]
+            and abs(metrics.get("midline_upper_vs_lower_left_mm", 0.0)) > 0.05
+        ):
+            # + means the upper midline lies to the patient's left; the upper arch frame's +x
+            # points to the patient's left, so the upper segment moves by the negative amount
+            adjust_u.midline_x = (
+                setups["upper"].midline_x - metrics["midline_upper_vs_lower_left_mm"]
+            )
+            changed = True
+        # new occlusal interferences: intrude both teeth of the pair (and their left/right
+        # counterparts, so the arch stays symmetric) by half the excess each, within a cap
+        front_excess = 0.0
+        for hit in metrics["interferences"]:
+            excess = hit["depth_mm"] - baseline.get((hit["lower"], hit["upper"]), 0.0) - 0.05
+            if (
+                excess > 0.05
+                and fdi.position(hit["lower"]) <= 3
+                and fdi.position(hit["upper"]) <= 3
+            ):
+                # lower incisors against the upper ones: bring the upper front along
+                front_excess = max(front_excess, excess)
+            elif excess > 0.05:
+                for adj, n, jaw in (
+                    (adjust_l, hit["lower"], "lower"),
+                    (adjust_u, hit["upper"], "upper"),
                 ):
-                    # lower incisors against the upper ones: bring the upper front along
-                    front_excess = max(front_excess, excess)
-                elif excess > 0.05:
-                    for adj, n, jaw in (
-                        (adjust_l, hit["lower"], "lower"),
-                        (adjust_u, hit["upper"], "upper"),
-                    ):
-                        twin = fdi.fdi_number(jaw, not fdi.is_patient_right(n), fdi.position(n))
-                        for m in {n, twin}:
-                            adj.tooth_dz[m] = max(
-                                adj.tooth_dz.get(m, 0.0) - (excess / 2 + 0.05), -MAX_BITE_DZ_MM
-                            )
-                    changed = True
-            if front_excess > 0:
-                # bring the upper front forward as far as allowed, then open the bite (intrude the
-                # incisors, keeping the minimum overbite): lower incisal edges that sit lower meet
-                # the upper palatal surfaces further labially
-                need = front_excess + 0.05
-                current = adjust_u.delta if adjust_u.delta is not None else setups["upper"].delta
-                advance = min(need, max(0.0, goals["max_incisor_advance_mm"] - current))
-                if advance > 0.01:
-                    adjust_u.delta = current + advance
-                    changed = True
-                spare = metrics["overbite_mm"] - bite["min_overbite_mm"]
-                if need - advance > 0.01 and spare > 0.05:
-                    dz = min(2.0 * (need - advance), spare)
-                    adjust_u.anterior_dz -= dz * bite["overbite_split"]
-                    adjust_l.anterior_dz -= dz * (1 - bite["overbite_split"])
-                    changed = True
-            if not changed:
-                break
-            setups["lower"] = solvers["lower"].solve(adjust_l)
-            setups["upper"] = solvers["upper"].solve(adjust_u)
+                    twin = fdi.fdi_number(jaw, not fdi.is_patient_right(n), fdi.position(n))
+                    for m in {n, twin}:
+                        adj.tooth_dz[m] = max(
+                            adj.tooth_dz.get(m, 0.0) - (excess / 2 + 0.05), -MAX_BITE_DZ_MM
+                        )
+                changed = True
+        if front_excess > 0:
+            # bring the upper front forward as far as allowed, then open the bite (intrude the
+            # incisors, keeping the minimum overbite): lower incisal edges that sit lower meet
+            # the upper palatal surfaces further labially
+            need = front_excess + 0.05
+            current = adjust_u.delta if adjust_u.delta is not None else setups["upper"].delta
+            advance = (
+                min(need, max(0.0, goals["max_incisor_advance_mm"] - current)) if couple else 0.0
+            )
+            if advance > 0.01:
+                adjust_u.delta = current + advance
+                changed = True
+            spare = metrics["overbite_mm"] - bite["min_overbite_mm"]
+            if need - advance > 0.01 and spare > 0.05:
+                dz = min(2.0 * (need - advance), spare)
+                adjust_u.anterior_dz -= dz * bite["overbite_split"]
+                adjust_l.anterior_dz -= dz * (1 - bite["overbite_split"])
+                changed = True
+        if not changed:
+            break
+        setups["lower"] = solvers["lower"].solve(adjust_l)
+        setups["upper"] = solvers["upper"].solve(adjust_u)
 
+
+def coordinate_arches(
+    anatomies: dict[Jaw, JawAnatomy],
+    solvers: dict[Jaw, JawSolver],
+    setups: Setups,
+    to_bite: dict[Jaw, Array],
+    goals: dict[str, Any],
+    baseline: dict[tuple[int, int], float],
+) -> None:
+    """Settle the bite, trading lower incisor advancement for lower IPR where the upper front
+    would be left with spaces."""
+    adjust = {"upper": Adjust(), "lower": Adjust()}
+    adjust_u, adjust_l = adjust["upper"], adjust["lower"]
     for _ in range(COORDINATION_PASSES):
-        settle_bite()
+        settle_bite(anatomies, solvers, setups, adjust, to_bite, goals, baseline)
         # The upper front advanced to make room for the lower incisors and is left with spaces
         # (the lower front is too wide for it, Bolton excess): advance the lower incisors less,
         # so IPR in the lower front takes over, and settle the bite again. An incisor advance
@@ -800,11 +844,175 @@ def run_setup(case: Case) -> dict[str, Any]:
         adjust_u.anterior_dz = adjust_l.anterior_dz = 0.0  # the bite opening was for that advance
         setups["lower"] = solvers["lower"].solve(adjust_l)
         setups["upper"] = solvers["upper"].solve(adjust_u)
+
+
+def _verticals(to_bite: dict[Jaw, Array]) -> dict[Jaw, Array]:
+    """The frontal-view vertical in each arch frame: the lower arch's occlusal normal."""
+    up_to_low = (np.linalg.inv(to_bite["lower"]) @ to_bite["upper"])[:3, :3]
+    return {"lower": np.array([0.0, 0.0, 1.0]), "upper": up_to_low.T @ [0.0, 0.0, 1.0]}
+
+
+def _head_verticals(Q: dict[Jaw, Array]) -> dict[Jaw, Array]:
+    """The head's vertical (after surgery) in each arch frame."""
+    return {jaw: Q[jaw][:3, :3].T @ np.array([0.0, 0.0, 1.0]) for jaw in Q}
+
+
+def _solve_orthodontic(
+    anatomies: dict[Jaw, JawAnatomy],
+    plan: dict[str, Any],
+    to_bite: dict[Jaw, Array],
+    vertical: dict[Jaw, Array],
+    baseline: dict[tuple[int, int], float],
+) -> Setups:
+    goals = plan["goals"]
+    solvers = {
+        jaw: JawSolver(a, goals, plan["teeth"], vertical[jaw]) for jaw, a in anatomies.items()
+    }
+    setups = {jaw: s.solve() for jaw, s in solvers.items()}
+    coordinate_arches(anatomies, solvers, setups, to_bite, goals, baseline)
+    return setups
+
+
+def _solve_auto(
+    case: Case, anatomies: dict[Jaw, JawAnatomy], plan: dict[str, Any]
+) -> tuple[Setups, dict[str, Array], dict[str, Any], "HeadFrames"]:
+    """Decompensated arches, then the jaw movements of their ideal occlusion (see surgery.py)."""
+    from aligners.surgery import (
+        Occlusion,
+        dental_landmarks,
+        distribute,
+        head_frames,
+        incisor_target_axes,
+        mandible_landmarks,
+        mandibular_plane_normal,
+    )
+
+    goals = plan["goals"]
+    cfg = plan["surgery"]["auto"]
+    hf = head_frames(case, plan, anatomies)
+    mand = mandible_landmarks(case, hf, anatomies["lower"])
+    mp = mandibular_plane_normal(mand)
+    X = np.linalg.inv(hf.P["lower"]) @ hf.P["upper"]
+    Q = dict(hf.P)
+    M = {"maxilla": np.eye(4), "mandible": np.eye(4)}
+    warnings: list[str] = []
+    occlusion: dict[str, Any] = {}
+    setups: Setups = {}
+    solvers: dict[Jaw, JawSolver] = {}
+    adjust: dict[Jaw, Adjust] = {}
+
+    def place_jaws() -> None:
+        nonlocal X, occlusion
+        poses = {jaw: s.poses for jaw, s in setups.items()}
+        occ = Occlusion(
+            anatomies["upper"],
+            poses["upper"],
+            anatomies["lower"],
+            poses["lower"],
+            goals["bite"]["overjet_mm"],
+        )
+        X, occlusion = occ.solve(X)
+        up_lm = dental_landmarks(anatomies["upper"], poses["upper"])
+        M["maxilla"], M["mandible"], dist_warnings = distribute(X, hf, cfg, up_lm, mand)
+        occlusion["warnings"] += dist_warnings
+        Q["upper"] = M["maxilla"] @ hf.P["upper"]
+        Q["lower"] = M["mandible"] @ hf.P["lower"]
+
+    for _ in range(2):
+        vertical = _head_verticals(Q)
+        axes = incisor_target_axes(anatomies, Q, mp, cfg)
+        if mp is None:
+            warnings.append("mandibular plane not found: lower incisors keep their inclination")
+        solvers = {
+            jaw: JawSolver(a, goals, plan["teeth"], vertical[jaw], axes.get(jaw))
+            for jaw, a in anatomies.items()
+        }
+        adjust = {
+            jaw: Adjust(delta=s.decompensation_delta(), reason="incisor decompensation")
+            for jaw, s in solvers.items()
+        }
+        setups = {jaw: solvers[jaw].solve(adjust[jaw]) for jaw in solvers}
+        place_jaws()
+    settle_bite(anatomies, solvers, setups, adjust, Q, goals, {}, couple=False)
+    place_jaws()
+    extra = {
+        "osteotomies": list(cfg["osteotomies"]),
+        "bsso": "bsso" in cfg["osteotomies"],
+        "occlusion": occlusion,
+        "warnings": sorted(set(warnings + occlusion.pop("warnings"))),
+    }
+    return setups, M, extra, hf
+
+
+def _surgical_frames(
+    case: Case, anatomies: dict[Jaw, JawAnatomy], plan: dict[str, Any]
+) -> tuple[dict[str, Array], dict[str, Any], "HeadFrames"]:
+    """Manual mode: the surgeon's movement tables as head-frame jaw movements."""
+    from aligners.surgery import dental_landmarks, head_frames, table_to_transform, to_head
+
+    hf = head_frames(case, plan, anatomies)
+    M: dict[str, Array] = {}
+    residuals: dict[str, dict[str, float]] = {}
+    for jaw, bone in (("upper", "maxilla"), ("lower", "mandible")):
+        pre = to_head(hf.P[jaw], dental_landmarks(anatomies[jaw]))
+        M[bone], residuals[bone] = table_to_transform(plan["surgery"][bone], pre, bone)
+    extra = {
+        "bsso": bool(plan["surgery"]["mandible"]),
+        "fit_residual_mm": residuals,
+        "warnings": [
+            f"surgery.{bone}.{name}: {r:.1f} mm off the rigid movement through the other points"
+            for bone, res in residuals.items()
+            for name, r in res.items()
+            if r > 0.3
+        ],
+    }
+    return M, extra, hf
+
+
+def run_setup(case: Case) -> dict[str, Any]:
+    plan = case.plan()
+    mode = plan["surgery"]["mode"]
+    for key in plan["teeth"]:
+        if not fdi.is_valid(int(key)):
+            raise CaseError(f'[teeth."{key}"] is not an FDI tooth number')
+    anatomies = {
+        jaw: JawAnatomy.load(case.require(case.anatomy_dir(jaw), "segment"), jaw)
+        for jaw in case.jaws()
+    }
+    to_bite = arch_to_bite(case)
+    if to_bite is None:
+        raise CaseError("frames.json has no bite; run `aligners segment` again")
+    result: dict[str, Any] = {"warnings": []}
+    surgery: dict[str, Any] | None = None
+    if mode == "none":
+        initial = analyze_bite(anatomies["upper"], anatomies["lower"], to_bite)
+        baseline = {(i["lower"], i["upper"]): i["depth_mm"] for i in initial["interferences"]}
+        setups = _solve_orthodontic(anatomies, plan, to_bite, _verticals(to_bite), baseline)
+        final_bite = to_bite
+    else:
+        from aligners.surgery import surgery_report
+
+        if mode == "manual":
+            M, extra, hf = _surgical_frames(case, anatomies, plan)
+            final_bite = {jaw: M[BONE[jaw]] @ hf.P[jaw] for jaw in hf.P}
+            # pre-existing contacts mean nothing in a new jaw relation: no interference baseline
+            setups = _solve_orthodontic(
+                anatomies, plan, final_bite, _head_verticals(final_bite), {}
+            )
+        else:
+            setups, M, extra, hf = _solve_auto(case, anatomies, plan)
+            final_bite = {jaw: M[BONE[jaw]] @ hf.P[jaw] for jaw in hf.P}
+        final = {jaw: s.poses for jaw, s in setups.items()}
+        surgery = surgery_report(case, plan, anatomies, hf, M, final, extra)
+        result["warnings"] += [f"surgery: {w}" for w in extra["warnings"]]
     result["jaws"] = {jaw: _jaw_report(anatomies[jaw], s) for jaw, s in setups.items()}
     for jaw, s in setups.items():
         result["warnings"] += [f"{jaw}: {w}" for w in s.warnings]
     result["bite_after"] = analyze_bite(
-        anatomies["upper"], anatomies["lower"], to_bite, {j: s.poses for j, s in setups.items()}
+        anatomies["upper"], anatomies["lower"], final_bite, {j: s.poses for j, s in setups.items()}
     )
+    result["arch_to_bite_final"] = final_bite
+    if surgery is not None:
+        result["surgery"] = surgery
     write_json(case.work / "setup.json", result)
     return result

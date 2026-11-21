@@ -7,7 +7,13 @@ from scipy import ndimage
 from scipy.spatial import KDTree
 
 from aligners import fdi
-from aligners.analyze import analyze_bite, arch_to_bite, contact_pairs, posed_tooth
+from aligners.analyze import (
+    analyze_bite,
+    arch_to_bite,
+    contact_pairs,
+    final_arch_to_bite,
+    posed_tooth,
+)
 from aligners.anatomy import JawAnatomy
 from aligners.case import Case, read_json, write_json
 from aligners.fdi import JAWS, Jaw
@@ -18,6 +24,14 @@ LIMIT_SLACK = 1.02
 ROOT_GAP_MM = 0.5
 ROOT_OUTSIDE_INCREASE = 0.15
 MAX_RMSE_MM = 0.5
+# Beyond these jaw movements (mm at the incisor midline, deg) relapse and complications grow.
+SURGERY_LIMITS = {
+    "maxilla": {"forward": 8.0, "back": 2.0, "up": 6.0, "down": 3.0},
+    "mandible": {"forward": 10.0, "back": 7.0, "up": 6.0, "down": 6.0},
+}
+MAX_ANGLE_CHANGE_DEG = 5.0
+CHIN_OFF_MIDLINE_MM = 2.0
+MAX_SPLIT_OVERLAP_MM = 3.0
 
 
 def _finding(severity: str, code: str, message: str, **extra: Any) -> dict[str, Any]:
@@ -120,6 +134,73 @@ def roots(
     return out
 
 
+def surgery_findings(surgery: dict[str, Any]) -> list[dict[str, Any]]:
+    """Warnings about the planned jaw movements."""
+    out = []
+    for bone, limits in SURGERY_LIMITS.items():
+        move = surgery["movements"][bone].get("incisor_midline")
+        if move is None:
+            continue
+        for name, value in (
+            ("forward", move["forward_mm"]),
+            ("back", -move["forward_mm"]),
+            ("up", move["up_mm"]),
+            ("down", -move["up_mm"]),
+        ):
+            if value > limits[name]:
+                out.append(
+                    _finding(
+                        "warning",
+                        "surgery_magnitude",
+                        f"{bone} moves {value:.1f} mm {name} (beyond ~{limits[name]:.0f} mm "
+                        "stability is doubtful)",
+                    )
+                )
+        a = surgery["angles"][bone]
+        for key in ("cant_deg", "yaw_deg", "occlusal_pitch_deg"):
+            if key in a["before_surgery"] and key in a["after_surgery"]:
+                change = a["after_surgery"][key] - a["before_surgery"][key]
+                if abs(change) > MAX_ANGLE_CHANGE_DEG:
+                    out.append(
+                        _finding(
+                            "warning",
+                            "surgery_magnitude",
+                            f"{bone} {key.removesuffix('_deg')} changes by {change:+.1f} deg",
+                        )
+                    )
+    for bone, res in surgery.get("fit_residual_mm", {}).items():
+        for name, r in res.items():
+            if r > 0.3:
+                out.append(
+                    _finding(
+                        "warning",
+                        "surgery_fit",
+                        f"surgery.{bone}.{name} is {r:.1f} mm off a rigid movement: check the entry",
+                    )
+                )
+    for name, offset in surgery["chin_mm"].items():
+        if abs(offset) > CHIN_OFF_MIDLINE_MM:
+            side = "left" if offset > 0 else "right"
+            out.append(
+                _finding(
+                    "warning",
+                    "chin",
+                    f"after surgery the {name} lies {abs(offset):.1f} mm {side} of the facial "
+                    "midline (genioplasty is not planned)",
+                )
+            )
+    for side, gap in surgery["split_gap_mm"].items():
+        if gap < -MAX_SPLIT_OVERLAP_MM:
+            out.append(
+                _finding(
+                    "warning",
+                    "split_overlap",
+                    f"{side} sagittal split: segments overlap by about {-gap:.1f} mm",
+                )
+            )
+    return out
+
+
 def run_check(case: Case) -> dict[str, Any]:
     staged = read_json(case.require(case.work / "stages.json", "stage"))
     limits = case.config()["staging"]
@@ -154,10 +235,15 @@ def run_check(case: Case) -> dict[str, Any]:
                 )
         findings += roots(case, jaw, anatomies[jaw], final[jaw])
     to_bite = arch_to_bite(case)
+    surgery = read_json(case.work / "setup.json").get("surgery")
+    if surgery:
+        findings += surgery_findings(surgery)
     if to_bite:
-        start = analyze_bite(anatomies["upper"], anatomies["lower"], to_bite)
-        end = analyze_bite(anatomies["upper"], anatomies["lower"], to_bite, final)
-        before = {(i["lower"], i["upper"]): i["depth_mm"] for i in start["interferences"]}
+        end = analyze_bite(anatomies["upper"], anatomies["lower"], final_arch_to_bite(case), final)
+        before: dict[tuple[int, int], float] = {}
+        if not surgery:  # after surgery the scanned contacts no longer exist
+            start = analyze_bite(anatomies["upper"], anatomies["lower"], to_bite)
+            before = {(i["lower"], i["upper"]): i["depth_mm"] for i in start["interferences"]}
         for i in end["interferences"]:
             if i["depth_mm"] > before.get((i["lower"], i["upper"]), 0.0) + 0.1:
                 findings.append(
@@ -181,12 +267,16 @@ def run_check(case: Case) -> dict[str, Any]:
             )
         for side, m in end["molar_relationship"].items():
             if m["class"] != "I":
+                fix = (
+                    "after the planned surgery"
+                    if surgery
+                    else "correcting this needs elastics, which this tool does not plan"
+                )
                 findings.append(
                     _finding(
                         "warning",
                         "molar_class",
-                        f"{side} molars Class {m['class']} ({m['offset_mm']:+.1f} mm): correcting this needs "
-                        "elastics, which this tool does not plan",
+                        f"{side} molars Class {m['class']} ({m['offset_mm']:+.1f} mm): {fix}",
                     )
                 )
     manifest = case.out / "manifest.json"

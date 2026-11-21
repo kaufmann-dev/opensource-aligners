@@ -218,8 +218,10 @@ def merge_labels(seg: NDArray[Any]) -> tuple[NDArray[np.uint8], list[str]]:
     return out, warnings
 
 
-def _mask_mesh(vol: Volume, mask: NDArray[np.bool_], faces: int) -> trimesh.Trimesh:
-    """Smooth surface of a binary mask, in world mm."""
+def mask_mesh(
+    vol: Volume, mask: NDArray[np.bool_], faces: int, voxel_mm: float = MESH_VOXEL_MM
+) -> trimesh.Trimesh:
+    """Smooth surface of a binary mask on `vol`'s grid, in world mm, meshed at `voxel_mm`."""
     margin = np.ceil(3.0 / vol.spacing).astype(int)
     idx = np.argwhere(mask)
     lo = np.maximum(idx.min(axis=0) - margin, 0)
@@ -227,7 +229,7 @@ def _mask_mesh(vol: Volume, mask: NDArray[np.bool_], faces: int) -> trimesh.Trim
     crop = mask[lo[0] : hi[0], lo[1] : hi[1], lo[2] : hi[2]].astype(np.float32)
     crop = np.pad(crop, 1)
     smooth = ndimage.gaussian_filter(crop, MASK_SIGMA_MM / vol.spacing)
-    step = MESH_VOXEL_MM / vol.spacing
+    step = voxel_mm / vol.spacing
     axes = [np.arange(0, n - 1 + 1e-6, s) for n, s in zip(smooth.shape, step, strict=True)]
     grid = np.meshgrid(*axes, indexing="ij")
     fine = ndimage.map_coordinates(smooth, grid, order=1)
@@ -258,7 +260,12 @@ def run_ct(case: Case, force: bool = False, device: str | None = None) -> dict[s
         info["segmentation"] = "reused"
     elif inputs["ct_seg"]:
         shutil.copyfile(inputs["ct_seg"], seg_path)
-        info["import"] = {"source": inputs["ct_seg"], "series": None}
+        if inputs["ct"]:
+            # the CT image is still needed for the head frame (surgical modes, face metrics)
+            info["import"] = _import_ct(case, Path(inputs["ct"]), inputs["series"])
+        else:
+            (case.ct_dir / "ct.nii.gz").unlink(missing_ok=True)
+            info["import"] = {"source": inputs["ct_seg"], "series": None}
         info["segmentation"] = "provided"
     else:
         info["import"] = _import_ct(case, Path(inputs["ct"]), inputs["series"])
@@ -291,7 +298,7 @@ def run_ct(case: Case, force: bool = False, device: str | None = None) -> dict[s
     }
     for jaw, mask in bones.items():
         if mask.any():
-            write_mesh(case.ct_dir / f"jawbone_{jaw}.ply", _mask_mesh(seg, mask, BONE_FACES))
+            write_mesh(case.ct_dir / f"jawbone_{jaw}.ply", mask_mesh(seg, mask, BONE_FACES))
     np.savez_compressed(
         case.ct_dir / "jawbone.npz",
         upper=bones["upper"],
@@ -309,7 +316,7 @@ def run_ct(case: Case, force: bool = False, device: str | None = None) -> dict[s
         if voxels * voxel_mm3 < 20.0:
             info["warnings"].append(f"tooth {number} ignored: only {voxels * voxel_mm3:.1f} mm^3")
             continue
-        mesh = _mask_mesh(seg, mask, TOOTH_FACES)
+        mesh = mask_mesh(seg, mask, TOOTH_FACES)
         jaw = fdi.jaw_of(number)
         dist = ndimage.map_coordinates(
             bone_distance[jaw], seg.to_index(np.asarray(mesh.vertices)).T, order=1, mode="nearest"
@@ -338,5 +345,17 @@ def run_ct(case: Case, force: bool = False, device: str | None = None) -> dict[s
     if not teeth:
         raise CaseError("segmentation contains no teeth")
     info["teeth"] = teeth
+    if (case.ct_dir / "ct.nii.gz").exists():
+        from aligners.skull import build_head_frame
+
+        head = build_head_frame(case, seg, labels)
+        info["head_frame"] = {"symmetry_rmse_mm": head["symmetry_rmse_mm"]}
+        info["warnings"] += head["warnings"]
+    else:
+        for stale in ("skull.json", "bone.npz"):
+            (case.ct_dir / stale).unlink(missing_ok=True)
+        info["warnings"].append(
+            "no CT image (only a labelmap): surgical modes and face metrics need --ct"
+        )
     write_json(info_path, info)
     return info

@@ -16,14 +16,13 @@ from aligners.case import CaseError
 from aligners.fdi import Jaw
 from aligners.geometry import (
     Array,
-    ICPTarget,
     boundary_loops,
     clean_mesh,
     frame_matrix,
+    mirror_plane,
     orthonormal_frame,
     pca,
     subsample,
-    transform_points,
 )
 
 CUSP_BAND_QUANTILE = 0.75
@@ -49,30 +48,6 @@ def patient_right_sign(jaw: Jaw) -> float:
     return 1.0 if jaw == "lower" else -1.0
 
 
-def _mirror_plane(points: Array, normals: Array, occlusal: Array) -> tuple[Array, Array, float]:
-    """Best sagittal symmetry plane (normal, point) of a cusp band, by mirror-ICP search."""
-    target = ICPTarget(points, normals)
-    c = points.mean(axis=0)
-    u, v, _ = orthonormal_frame(occlusal, np.cross(occlusal, [1.0, 0.0, 0.0]) + 1e-9)
-    best: tuple[float, Array] | None = None
-    for theta in np.radians(np.arange(0, 180, 5)):
-        s = np.cos(theta) * u + np.sin(theta) * v
-        R = np.eye(4)
-        R[:3, :3] -= 2 * np.outer(s, s)
-        R[:3, 3] = 2 * np.dot(c, s) * s
-        T, rmse = target.icp(transform_points(R, points), iterations=10, trim=0.7)
-        if best is None or rmse < best[0]:
-            best = (rmse, T @ R)
-    assert best is not None
-    M = best[1]
-    w, vecs = np.linalg.eig(M[:3, :3])
-    normal = np.real(vecs[:, np.argmin(np.abs(w + 1))])
-    normal -= np.dot(normal, occlusal) * occlusal
-    normal /= np.linalg.norm(normal)
-    point = (c + transform_points(M, c[None])[0]) / 2
-    return normal, point, best[0]
-
-
 def arch_frame(mesh: trimesh.Trimesh) -> tuple[Array, dict[str, Any]]:
     """World->arch transform of a scan and diagnostics."""
     V = np.asarray(mesh.vertices, dtype=np.float64)
@@ -89,7 +64,7 @@ def arch_frame(mesh: trimesh.Trimesh) -> tuple[Array, dict[str, Any]]:
     heights = (V - c) @ occlusal
     band = np.flatnonzero(heights >= np.quantile(heights, CUSP_BAND_QUANTILE))
     band = band[subsample(V[band], 4000)]
-    normal, point, rmse = _mirror_plane(V[band], N[band], occlusal)
+    normal, point, rmse = mirror_plane(V[band], N[band], occlusal)
 
     anterior = np.cross(occlusal, normal)
     P = V[band]

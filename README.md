@@ -24,11 +24,20 @@ aligners for every stage.
    - It keeps minimum overjet/overbite and clears occlusal interferences.
    - It coordinates both arches: lower IPR replaces proclination when the upper front would be
      left with spaces.
-5. **Stage**: splits the movement into aligner stages within per-stage limits and schedules
+5. **Surgery (optional)**: plans the teeth for the jaw position after orthognathic surgery
+   (Le Fort I, BSSO), with orthodontics before surgery.
+   - `auto` sets up each arch on its own jaw (decompensation) and solves the jaw movements for
+     an ideal occlusion and a level, centered maxilla.
+   - `manual` takes the surgeon's planned movements as a landmark table, e.g. the rows of a
+     ProPlan CMF report, and fits the teeth to that jaw relation.
+   - The facial midline comes from the mirror symmetry of the cranium in the CT.
+   - Both write the jaw movements as a table, angles, transforms, landmarks and bone/teeth STLs
+     in DICOM coordinates.
+6. **Stage**: splits the movement into aligner stages within per-stage limits and schedules
    teeth so neighbors never collide.
-6. **Check**: validates stage limits, collisions, registration, roots (proximity, bone), bite
-   and the fabricated parts.
-7. **Export**: writes, per stage, a trimmed aligner shell for direct printing and a model with
+7. **Check**: validates stage limits, collisions, registration, roots (proximity, bone), bite
+   (after surgery in the surgical modes), jaw movement sizes and the fabricated parts.
+8. **Export**: writes, per stage, a trimmed aligner shell for direct printing and a model with
    base and trim-line groove for thermoforming. It also writes an attachment bonding template,
    `manifest.json` and an interactive 3D `preview.html`.
 
@@ -55,6 +64,8 @@ A case needs:
   (bite-registered) give the most accurate bite.
 - **A CT of the jaws**: a DICOM folder (`--ct`) or an existing TotalSegmentator `teeth`
   labelmap (`--ct-seg`).
+- **Surgical modes only**: the CT image (`--ct`, also when `--ct-seg` is given) covering the
+  skull above the teeth (orbits, cranial base), so the facial midline can be found.
 
 ## Usage
 
@@ -76,13 +87,29 @@ uv run aligners check cases/me         # exit code 2 = errors
 uv run aligners export cases/me --jobs 4
 ```
 
-Treatment goals and per-tooth overrides live in `cases/me/plan.toml`; every key is documented
-inline. Fabrication and staging parameters live in `cases/me/case.toml`.
+Treatment goals, per-tooth overrides and the surgery mode live in `cases/me/plan.toml`; every key
+is documented inline. Fabrication and staging parameters live in `cases/me/case.toml`.
+
+For a surgical case, set `[surgery] mode = "auto"` or `"manual"` in `plan.toml`:
+- `auto` chooses the jaw movements. `[surgery.auto]` sets which osteotomies it may use and the
+  maxilla's forward/vertical/pitch.
+- `manual` reads the movements from `[surgery.maxilla]` and `[surgery.mandible]`: the
+  displacement of each landmark in mm, `forward_mm`, `up_mm` and `left_mm`. The landmarks are
+  the incisor midline, both canines and both first molars.
+
+`setup` then renders `work/renders/surgery.png`, and `analyze` reports the face metrics (cant,
+yaw, midlines, chin, incisor angles).
 
 Outputs are written to `cases/me/out/`:
 - `<jaw>/aligner_NN.stl`, `<jaw>/model_NN.stl` and `<jaw>/template.stl`
 - `manifest.json`: wear order, IPR before stage 1, attachments
-- `preview.html`
+- `preview.html`, with a before/after surgery view in the surgical modes
+- surgical modes, in `surgery/`:
+  - `movements.toml`: the planned movements in the `plan.toml` input format;
+  - `movements.json`: tables, angles, transforms, split gaps;
+  - `landmarks.json`: named landmarks in CT and head coordinates, for other planning software;
+  - STLs of the maxilla, mandible segments, cranium and teeth before/after surgery, in CT DICOM
+    (LPS) coordinates.
 
 `cases/` is git-ignored: case folders contain medical data.
 

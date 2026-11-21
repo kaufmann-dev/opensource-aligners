@@ -145,6 +145,52 @@ class ICPTarget:
         return T, rmse
 
 
+def mirror_plane(
+    points: Array, normals: Array, axis: Array, contain_axis: bool = True
+) -> tuple[Array, Array, float]:
+    """Best mirror-symmetry plane (unit normal, point, trimmed RMSE) of a point cloud.
+
+    The normal is searched perpendicular to `axis` in 5 degree steps and the mirrored copy is
+    refined by ICP. With `contain_axis` the plane is then forced to contain `axis`; otherwise
+    the ICP refinement may tilt it (e.g. a head rolled on the CT table)."""
+    target = ICPTarget(points, normals)
+    c = points.mean(axis=0)
+    u, v, _ = orthonormal_frame(axis, np.cross(axis, [1.0, 0.0, 0.0]) + 1e-9)
+    best: tuple[float, Array] | None = None
+    for theta in np.radians(np.arange(0, 180, 5)):
+        s = np.cos(theta) * u + np.sin(theta) * v
+        R = np.eye(4)
+        R[:3, :3] -= 2 * np.outer(s, s)
+        R[:3, 3] = 2 * np.dot(c, s) * s
+        T, rmse = target.icp(transform_points(R, points), iterations=10, trim=0.7)
+        if best is None or rmse < best[0]:
+            best = (rmse, T @ R)
+    assert best is not None
+    M = best[1]
+    w, vecs = np.linalg.eig(M[:3, :3])
+    normal = np.real(vecs[:, np.argmin(np.abs(w + 1))])
+    if contain_axis:
+        normal -= np.dot(normal, axis) * axis
+    normal /= np.linalg.norm(normal)
+    point = (c + transform_points(M, c[None])[0]) / 2
+    return normal, point, best[0]
+
+
+def rigid_fit(src: Array, dst: Array) -> tuple[Array, Array]:
+    """Least-squares rigid transform (Kabsch, no scaling) mapping src points onto dst, and the
+    per-point residual distances. A single point gives a pure translation."""
+    src = np.atleast_2d(np.asarray(src, dtype=np.float64))
+    dst = np.atleast_2d(np.asarray(dst, dtype=np.float64))
+    T = np.eye(4)
+    cs, cd = src.mean(axis=0), dst.mean(axis=0)
+    if len(src) >= 3:
+        U, _, Vt = np.linalg.svd((src - cs).T @ (dst - cd))
+        d = np.sign(np.linalg.det(Vt.T @ U.T))
+        T[:3, :3] = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    T[:3, 3] = cd - T[:3, :3] @ cs
+    return T, np.linalg.norm(transform_points(T, src) - dst, axis=1)
+
+
 class MeshSDF:
     """Signed distance to a (nearly) closed triangle mesh; negative inside.
 

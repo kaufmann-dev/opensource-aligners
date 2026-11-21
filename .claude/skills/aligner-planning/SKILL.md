@@ -35,7 +35,8 @@ image tool.
 3. `uv run aligners analyze cases/<name> --json`, then `aligners render ... --what bite`.
 4. Edit `cases/<name>/plan.toml` (goals + per-tooth overrides; every key is documented there).
 5. `uv run aligners setup cases/<name> --json`; view `setup_upper.png`, `setup_lower.png`,
-   and `aligners render ... --what bite:final`. Read warnings and `bite_after`.
+   and `aligners render ... --what bite:final`. Read warnings and `bite_after`. In surgical
+   modes also view `surgery.png` and read `surgery` (see Surgical cases).
 6. `uv run aligners stage cases/<name> --json`, then `uv run aligners check cases/<name> --json`
    (exit code 2 = errors). Repeat from 4 until `ok` is true and warnings are understood.
 7. `uv run aligners export cases/<name> --json` writes `out/<jaw>/aligner_NN.stl`,
@@ -84,12 +85,61 @@ image tool.
 - Midlines: `bite.align_midlines` (default on) moves the upper dental midline onto the lower
   one; `midline_shift_mm` per jaw (+ = patient left) moves a jaw's midline.
 - Posterior crossbite: expand the upper arch (`expand_premolar_mm`, `expand_molar_mm`).
-- Class II/III molar relationships need elastics or extractions; report them, do not plan them.
+- Class II/III molar relationships need elastics, extractions or surgery. Do not plan elastics or
+  extractions; report them. A skeletal cause can be planned with surgery (see Surgical cases).
 - Implants, crowned or ankylosed teeth: `[teeth."NN"] fixed = true`.
 - Individual corrections: `[teeth."NN"]` with `mesial_mm`, `buccal_mm`, `extrusion_mm`,
   `rotation_deg`, `tip_deg`, `torque_deg` (tooth frame, about the center of resistance).
 - Rotations of round teeth (canines/premolars) > 5 deg and extrusions > 0.5 mm get
   attachments automatically (`[attachments]` to add/remove).
+
+## Surgical cases (`[surgery]`)
+
+Orthodontics come first and surgery follows the last stage: the aligners move the teeth to fit
+the jaw relation after surgery. This needs the CT image (`inputs.ct`) showing the cranium above
+the teeth; `analyze` then reports `face` in the head frame (+x patient right, +y anterior, +z up).
+
+- Consider surgery when `face` or `bite` shows a skeletal problem that orthodontic compensation
+  would hide:
+  - occlusal cant > 2 deg or `cant_molars_mm` > 2 mm;
+  - chin (`chin_mm`) or dental midlines > 2-3 mm off the facial midline;
+  - Class II/III > 3 mm or a negative overjet.
+  The surgeon decides; you only plan the teeth for their plan.
+- `face.symmetry_rmse_mm` > 1.5 means the facial midline is uncertain: say so.
+- `head_pitch_deg` aligns the head horizontal with the surgeon's software. The measured
+  `face.maxilla.occlusal_pitch_deg` drops by `head_pitch_deg`. Set it to (measured − the
+  report's "Maxillary Occlusal Plane" angle), after confirming both use + = anterior up.
+- `mode = "manual"` (the surgeon's plan): copy the dental rows of the plan's point table
+  (ProPlan CMF: "Maxilla/Mandible Incisor Midline", "Canine L/R", "1st Molar L/R") into
+  `[surgery.maxilla]` / `[surgery.mandible]`.
+  - Signs: Ant = + `forward_mm`, Post = −; Up = + `up_mm`, Down = −; Left = + `left_mm`,
+    Right = −.
+  - Skip the skeletal rows (A, ANS, B, Pog, Me).
+  - Give one landmark for a pure translation, otherwise at least three.
+  - `setup` refuses entries that are more than 1.5 mm off one rigid movement (sign or side
+    mix-up) and warns above 0.3 mm.
+  - The teeth are then aligned with the usual goals against the post-surgical bite.
+- `mode = "auto"`:
+  - Each arch is set up on its own jaw: no compensation for the other jaw, incisors torqued to
+    `upper_incisor_deg` (to the horizontal, norm ~110) and `lower_incisor_deg` (IMPA, norm
+    ~93). If setup warns "incisor decompensation needs … limited", raise
+    `max_incisor_advance_mm` / `max_incisor_retract_mm` or adjust the targets.
+  - The solver then places the mandible for Class I and `bite.overjet_mm`. It levels and
+    centers the maxilla (cant, yaw, midline), using only `osteotomies`.
+  - Maxilla `forward/up/pitch` stay the surgeon's choice (looks, airway): keep them at 0 unless
+    told otherwise.
+  - `["bsso"]` alone cannot correct the maxilla. With `["lefort1"]` alone the mandible only
+    autorotates; residual asymmetry is reported.
+- Review:
+  - `surgery.png` (grey = before surgery) and `bite_final.png`;
+  - the `setup` movement table and angles: after surgery cant and yaw ≈ 0;
+  - `split_gap_mm` (+ gap, − overlap at the sagittal splits) and `chin_mm`;
+  - `check` warnings: `surgery_magnitude`, `chin` (genioplasty is not planned),
+    `split_overlap`, `surgery_fit`.
+- Hand the surgeon `out/surgery/movements.toml` (the same format as the manual input),
+  `movements.json` and the STLs (DICOM LPS coordinates, overlay on the CT). If they change the
+  plan, paste their values into `plan.toml` with `mode = "manual"` and rerun.
+- Skeletal landmarks (condyles, gonion, menton, pogonion) and split gaps are approximate.
 
 ## Judging results
 

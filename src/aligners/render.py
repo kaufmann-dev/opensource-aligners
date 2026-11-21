@@ -74,6 +74,8 @@ def _camera(
         return right, z
     if view == "left":
         return -right, z
+    if view == "inferior":
+        return -z, y
     raise ValueError(view)
 
 

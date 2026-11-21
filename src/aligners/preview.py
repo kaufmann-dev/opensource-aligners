@@ -18,7 +18,35 @@ from aligners.motion import decompose
 TOOTH_FACES = 5000
 ROOT_FACES = 2500
 GUM_FACES = 60000
+BONE_FACES = {"cranium": 40000}
+DEFAULT_BONE_FACES = 25000
 GUM_FOLLOW_MM = 3.0
+
+
+def _surgery_data(case: Case, report: dict[str, Any]) -> dict[str, Any]:
+    """Bone segments (CT coordinates) with their head-frame placement before/after surgery,
+    and the tables shown in the sidebar."""
+    from aligners.surgery import segment_poses
+
+    bones = {}
+    for name, (pre, post) in segment_poses(report).items():
+        path = case.work / "surgery" / f"{name}.ply"
+        if not path.exists():
+            continue
+        mesh = decimate(read_mesh(path), BONE_FACES.get(name, DEFAULT_BONE_FACES), max_error=0.2)
+        bones[name] = {
+            "mesh": _pack(mesh),
+            "pre": pre.T.ravel().round(6).tolist(),
+            "post": post.T.ravel().round(6).tolist(),
+        }
+    return {
+        "bones": bones,
+        "movements": report["movements"],
+        "angles": report["angles"],
+        "splits": report["split_gap_mm"],
+        "chin": report["chin_mm"],
+        "mode": report["mode"],
+    }
 
 
 def _pack(mesh: trimesh.Trimesh) -> dict[str, str]:
@@ -41,7 +69,10 @@ def build_preview(case: Case) -> str:
         else {}
     )
     to_bite = arch_to_bite(case)
+    report = read_json(case.require(case.work / "setup.json", "setup")).get("surgery")
     data: dict[str, Any] = {"jaws": {}, "findings": checks["findings"]}
+    if report:
+        data["surgery"] = _surgery_data(case, report)
     for jaw in JAWS:
         anatomy = JawAnatomy.load(case.anatomy_dir(jaw), jaw)
         scan = read_mesh(case.scan_dir / f"{jaw}.ply")
@@ -69,7 +100,11 @@ def build_preview(case: Case) -> str:
                 entry["root"] = _pack(decimate(anatomy.roots[n], ROOT_FACES, max_error=0.1))
             teeth[str(n)] = entry
         group = np.eye(4)
-        if to_bite:
+        group_post = None
+        if report:  # surgical modes are shown in the head frame, before/after surgery
+            group = np.asarray(report["arch_to_head"]["before_surgery"][jaw], float)
+            group_post = np.asarray(report["arch_to_head"]["after_surgery"][jaw], float)
+        elif to_bite:
             group = np.linalg.inv(to_bite["lower"]) @ to_bite[jaw]
         # gingiva follows the teeth near it with weight (1 - d/3mm)^2, blending the two nearest
         # crowns by inverse squared distance: a papilla between two moving teeth stretches
@@ -93,6 +128,7 @@ def build_preview(case: Case) -> str:
             "teeth": teeth,
             "stages": info["stages"],
             "group": group.T.ravel().round(6).tolist(),
+            "groupPost": None if group_post is None else group_post.T.ravel().round(6).tolist(),
             "ipr": info["ipr_mm"],
             "attachments": export_plan.get(jaw, {}).get("attachments", {}),
         }
@@ -149,6 +185,14 @@ TEMPLATE = r"""<!doctype html>
       <label><input type="checkbox" id="roots"> Roots (CT)</label>
       <label><input type="checkbox" id="ghost"> Initial ghost</label>
     </div>
+    <div id="surgeryBox" hidden>
+      <h1>Surgery</h1>
+      <div class="row">
+        <label><input type="checkbox" id="post"> After surgery</label>
+        <label><input type="checkbox" id="bone" checked> Bone</label>
+      </div>
+      <div id="surgery" class="muted"></div>
+    </div>
     <h1>IPR (before stage 1)</h1><div id="ipr" class="muted"></div>
     <h1>Attachments</h1><div id="att" class="muted"></div>
     <h1>Checks</h1><div id="checks"></div>
@@ -199,21 +243,36 @@ for (const [jaw, J] of Object.entries(DATA.jaws)) {
     const ghost = new THREE.Mesh(geo, ghostMat); ghost.visible = false; group.add(ghost); ghosts.push(ghost);
   }
 }
+const bones = [];
+if (DATA.surgery) {
+  const boneMat = new THREE.MeshStandardMaterial({ color: 0xe9e0c9, roughness: 0.8 });
+  const craniumMat = new THREE.MeshStandardMaterial({ color: 0xd9d4c7, roughness: 0.9, transparent: true, opacity: 0.35, depthWrite: false });
+  for (const [name, B] of Object.entries(DATA.surgery.bones)) {
+    const mesh = new THREE.Mesh(decode(B.mesh), name === 'cranium' ? craniumMat : boneMat);
+    mesh.matrixAutoUpdate = false; mesh.matrix.fromArray(B.pre); scene.add(mesh); bones.push({ mesh, B });
+  }
+}
+function setSurgery(post) {
+  for (const [jaw, J] of Object.entries(DATA.jaws)) groups[jaw].matrix.fromArray(post && J.groupPost ? J.groupPost : J.group);
+  for (const b of bones) b.mesh.matrix.fromArray(post ? b.B.post : b.B.pre);
+}
 const slider = document.getElementById('stage'); slider.max = maxStage;
 const VIEWS = {  // camera position, view-up; lower arch frame: +z toward the upper arch, +y anterior
   front: [[0, 110, 5], [0, 0, 1], null],
-  right: [[-110, -15, 5], [0, 0, 1], null],
-  left: [[110, -15, 5], [0, 0, 1], null],
+  right: [[110, -15, 5], [0, 0, 1], null],
+  left: [[-110, -15, 5], [0, 0, 1], null],
   upper: [[0, -18, -110], [0, 1, 0], 'upper'],
   lower: [[0, -18, 110], [0, 1, 0], 'lower'],
 };
+const ZOOM = DATA.surgery ? 2.4 : 1;  // the head frame shows the skull around the teeth
 function setView(name) {
   const [pos, up, only] = VIEWS[name];
-  camera.position.set(...pos); camera.up.set(...up); controls.target.set(0, -18, 0); controls.update();
+  camera.position.set(...pos.map(v => v * ZOOM)); camera.up.set(...up); controls.target.set(0, -18 * ZOOM, 0); controls.update();
   for (const jaw of ['upper', 'lower']) {
     const show = !only || only === jaw;
     groups[jaw].visible = show; document.getElementById(jaw).checked = show;
   }
+  if (DATA.surgery) { const show = !only && document.getElementById('bone').checked; bones.forEach(b => b.mesh.visible = show); }
 }
 document.querySelectorAll('[data-view]').forEach(b => b.onclick = () => setView(b.dataset.view));
 document.getElementById('stageMax').textContent = maxStage;
@@ -240,7 +299,7 @@ function setStage(s) {
   }
 }
 slider.oninput = () => setStage(+slider.value); setStage(0);
-window.preview = { setStage: (s) => { slider.value = s; setStage(s); }, setView, maxStage, camera, controls, groups, gums };
+window.preview = { setStage: (s) => { slider.value = s; setStage(s); }, setView, setSurgery, maxStage, camera, controls, groups, gums, bones };
 let timer = null;
 document.getElementById('play').onclick = (e) => {
   if (timer) { clearInterval(timer); timer = null; e.target.textContent = 'Play'; return; }
@@ -252,6 +311,22 @@ document.getElementById('gum').onchange = (e) => gums.forEach(g => g.visible = e
 document.getElementById('roots').onchange = (e) => roots.forEach(g => g.visible = e.target.checked);
 document.getElementById('ghost').onchange = (e) => ghosts.forEach(g => g.visible = e.target.checked);
 const list = (obj, fmt) => Object.entries(obj).map(fmt).join('<br>') || 'none';
+if (DATA.surgery) {
+  const S = DATA.surgery, f = v => (v > 0 ? '+' : '') + v.toFixed(1);
+  document.getElementById('surgeryBox').hidden = false;
+  document.getElementById('post').onchange = (e) => setSurgery(e.target.checked);
+  document.getElementById('bone').onchange = (e) => bones.forEach(b => b.mesh.visible = e.target.checked);
+  let html = `<div>mode: ${S.mode} (forward / up / left mm)</div>`;
+  for (const bone of ['maxilla', 'mandible']) {
+    html += `<b>${bone}</b><table>` + Object.entries(S.movements[bone]).map(([k, m]) => `<tr><td>${k.replace('_', ' ')}</td><td>${f(m.forward_mm)}</td><td>${f(m.up_mm)}</td><td>${f(m.left_mm)}</td></tr>`).join('') + '</table>';
+    const a = S.angles[bone], before = a.before_surgery, after = a.after_surgery;
+    html += '<table>' + ['cant_deg', 'yaw_deg', 'occlusal_pitch_deg', 'midline_mm'].filter(k => k in after).map(k => `<tr><td>${k.replace(/_/g, ' ')}</td><td>${f(before[k])} → ${f(after[k])}</td></tr>`).join('') + '</table>';
+  }
+  html += 'split gap (+) / overlap (−) mm: ' + list(S.splits, ([k, v]) => `${k} ${f(v)}`) + '<br>';
+  html += 'chin off midline (+ left) mm: ' + list(S.chin, ([k, v]) => `${k} ${f(v)}`);
+  document.getElementById('surgery').innerHTML = html;
+  setView('front');
+}
 document.getElementById('ipr').innerHTML = Object.entries(DATA.jaws).map(([j, J]) => `<b>${j}</b>: ` + list(J.ipr, ([k, v]) => `${k}: ${v.toFixed(2)} mm`)).join('<br>');
 document.getElementById('att').innerHTML = Object.entries(DATA.jaws).map(([j, J]) => `<b>${j}</b>: ` + list(J.attachments, ([k, v]) => `${k} ${v}`)).join('<br>');
 document.getElementById('checks').innerHTML = DATA.findings.length ? DATA.findings.map(f => `<div class="${f.severity}">${f.message}</div>`).join('') : '<div class="muted">no findings</div>';
